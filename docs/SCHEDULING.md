@@ -2,6 +2,8 @@
 
 _Last updated: 2026-09-14_
 
+> 中文版见 [`SCHEDULING.zh-CN.md`](./SCHEDULING.zh-CN.md)
+
 ## Executive Summary
 
 9Router picks **one upstream account per request** out of every usable account for a
