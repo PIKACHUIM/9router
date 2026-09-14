@@ -224,16 +224,24 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
 
     let candidates = availableConnections;
     let boundConnectionId = null;
+    // The account this session is pinned to, when it is still in the candidate set.
+    // It is kept as a PREFERENCE rather than collapsing `candidates` to a single
+    // element: collapsing made a busy bound account unrescuable (the concurrency
+    // walk below had no alternative to fall back to, so the session returned 503
+    // even while every other account was idle).
+    let boundConnection = null;
 
     if (sessionBindingEnabled && sessionId) {
       boundConnectionId = getBoundConnection(providerId, sessionId);
       if (boundConnectionId) {
-        const bound = candidates.find((c) => c.id === boundConnectionId);
-        if (bound) {
-          // HARD preference: a live session stays on its account — this is what
-          // preserves the provider-side prompt cache.
-          candidates = [bound];
-          log.debug("AUTH", `${provider} | session ${String(sessionId).slice(0, 8)} → bound ${boundConnectionId.slice(0, 8)}`);
+        boundConnection = candidates.find((c) => c.id === boundConnectionId) || null;
+        if (boundConnection) {
+          // Soft preference: the bound account is tried FIRST (it is what preserves
+          // the provider-side prompt cache) but the full candidate set is retained so
+          // the concurrency gate can still fail over when it is saturated.
+          const rest = candidates.filter((c) => c.id !== boundConnectionId);
+          candidates = [boundConnection, ...rest];
+          log.debug("AUTH", `${provider} | session ${String(sessionId).slice(0, 8)} → prefer bound ${boundConnectionId.slice(0, 8)}`);
         } else {
           // Bound account became unavailable/excluded → drop the stale binding and
           // re-select. bindSession() later will move the session.
@@ -320,6 +328,12 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
         const underCap = candidates.find((c) => getSessionCount(c.id) < maxSessions);
         if (underCap) {
           connection = underCap;
+          // The session's bound account is first in `candidates`, so ending up on a
+          // different one means the binding was skipped (it is either at its session
+          // cap, or the concurrency gate will reject it). Rebinding is handled below.
+          if (boundConnection && underCap.id !== boundConnection.id) {
+            log.info("AUTH", `${provider} | session ${String(sessionId).slice(0, 8)} bound ${boundConnection.id.slice(0, 8)} at session cap → using ${underCap.id.slice(0, 8)}`);
+          }
         } else if (overflowPolicy === "hard") {
           connection = null;
         } else {
@@ -358,10 +372,20 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       let gate = acquireAccountSlot(connection.id, maxConcurrent);
       if (!gate.ok) {
         log.debug("AUTH", `${provider} | ${connection.id.slice(0, 8)} at concurrency ceiling ${maxConcurrent} → try next candidate`);
-        const alt = candidates
-          .filter((c) => c.id !== connection.id)
-          .map((c) => ({ c, ok: acquireAccountSlot(c.id, maxConcurrent) }))
-          .find((x) => x.ok);
+        // Walk candidates LAZILY and stop at the first one that reserves a slot.
+        // Using .map() here would acquire a slot on EVERY candidate (map is eager)
+        // while .find() then keeps only one of them, leaking a count on all the
+        // others — and they are never released because only the returned account's
+        // slot is tracked by the caller.
+        let alt = null;
+        for (const c of candidates) {
+          if (c.id === connection.id) continue;
+          const ok = acquireAccountSlot(c.id, maxConcurrent);
+          if (ok.ok) {
+            alt = { c, ok };
+            break;
+          }
+        }
         if (alt) {
           connection = alt.c;
           gate = alt.ok;
@@ -387,7 +411,10 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
 
     // Optimistic consumption: discount this account's apparent remaining quota for
     // the next few seconds so a concurrent burst spreads instead of converging.
-    if (connection.id && connection.id !== "noauth") {
+    // Only meaningful for quota-weighted scoring — the discount is read exclusively
+    // by withOptimisticDiscount(), so recording it in other modes would just grow
+    // an unused map.
+    if (strategy === "quota-weighted" && connection.id && connection.id !== "noauth") {
       recordConsumption(connection.id, 1);
     }
 
