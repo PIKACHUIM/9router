@@ -4,10 +4,69 @@ import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLock
 import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
 import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
 import { getAntigravityQuotaCache } from "./antigravityQuota.js";
+import { acquire as acquireAccountSlot, release as releaseAccountSlotInternal, DEFAULT_MAX_CONCURRENT_PER_ACCOUNT } from "open-sse/services/accountLoad.js";
+import { getBoundConnection, bindSession, getSessionCount, startSessionBindingSweeper } from "open-sse/services/sessionBindings.js";
+import { pickQuotaWeighted, withOptimisticDiscount, recordConsumption } from "open-sse/services/quotaScheduler.js";
 import * as log from "../utils/logger.js";
 
-// Mutex to prevent race conditions during account selection
-let selectionMutex = Promise.resolve();
+// Mutex to prevent race conditions during account selection.
+//
+// Sharded per-provider: a single global mutex serialised selection across ALL
+// providers, so a slow provider (DNS/DB round-trips inside the section) blocked
+// unrelated providers. One promise chain per provider keeps ordering guarantees
+// where they matter (same-provider lastUsedAt / use-count updates) without the
+// cross-provider head-of-line blocking (audit item #8).
+const selectionMutexes = new Map(); // providerId -> Promise
+
+function acquireSelectionMutex(providerId) {
+  const key = providerId || "__global__";
+  const current = selectionMutexes.get(key) || Promise.resolve();
+  let release;
+  const next = new Promise((resolve) => { release = resolve; });
+  selectionMutexes.set(key, next);
+  return { current, release };
+}
+
+let sessionSweeperStarted = false;
+function ensureSessionSweeper(settings) {
+  if (sessionSweeperStarted) return;
+  sessionSweeperStarted = true;
+  startSessionBindingSweeper(
+    settings?.sessionIdleTtlMs || 30 * 60 * 1000,
+    settings?.sessionBindingSweepIntervalMs || 5 * 60 * 1000
+  );
+}
+
+/**
+ * Resolve a comparable quota descriptor for an account, for quota-weighted
+ * scheduling. Sources, in order:
+ *   1. Antigravity live quota cache (per-model remaining percentage + resetAt)
+ *   2. providerSpecificData.quota snapshot ({"remaining","total","resetAt"})
+ * Returns null when nothing is known — the scheduler then scores it neutral.
+ */
+function resolveAccountQuota(connection, providerId, model) {
+  if (providerId === "antigravity" && model) {
+    const cache = getAntigravityQuotaCache();
+    const q = cache?.get(connection.id)?.[model];
+    if (q) {
+      const resetAtMs = q.resetAt ? new Date(q.resetAt).getTime() : NaN;
+      return {
+        remaining: Number.isFinite(q.remainingPercentage) ? q.remainingPercentage : NaN,
+        total: 100,
+        resetAtMs,
+      };
+    }
+  }
+  const snap = connection.providerSpecificData?.quota;
+  if (snap && typeof snap === "object") {
+    const resetAtMs = snap.resetAt ? new Date(snap.resetAt).getTime() : NaN;
+    const remaining = Number(snap.remaining);
+    if (Number.isFinite(remaining)) {
+      return { remaining, total: Number(snap.total) || null, resetAtMs };
+    }
+  }
+  return null;
+}
 
 const GITHUB_MONTHLY_USAGE_LIMIT = "you've reached your additional usage limit for your plan";
 
@@ -31,16 +90,20 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     ? excludeConnectionIds
     : (excludeConnectionIds ? new Set([excludeConnectionIds]) : new Set());
   const preferredConnectionId = options?.preferredConnectionId || null;
-  // Acquire mutex to prevent race conditions
-  const currentMutex = selectionMutex;
-  let resolveMutex;
-  selectionMutex = new Promise(resolve => { resolveMutex = resolve; });
+  // Optional session identity for affinity binding. `sessionId` must be a stable
+  // per-conversation id (see open-sse/utils/sessionManager.js resolveSessionIdentity).
+  const sessionId = options?.sessionId || null;
+  // Whether the caller wants a concurrency slot reserved for this selection.
+  // Retries / internal fan-out may pass reserveSlot=false to avoid double-counting.
+  const reserveSlot = options?.reserveSlot !== false;
+  // Resolve alias to provider ID (e.g., "kc" -> "kilocode") BEFORE taking the lock
+  // so the shard key is stable regardless of alias spelling.
+  const providerId = resolveProviderId(provider);
+  // Acquire per-provider mutex to prevent race conditions within one provider
+  const { current: currentMutex, release: resolveMutex } = acquireSelectionMutex(providerId);
 
   try {
     await currentMutex;
-
-    // Resolve alias to provider ID (e.g., "kc" -> "kilocode")
-    const providerId = resolveProviderId(provider);
 
     // Inject a virtual connection for no-auth free providers (with optional proxy pool from settings)
     if (FREE_PROVIDERS[providerId]?.noAuth) {
@@ -134,25 +197,81 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     }
 
     const settings = await getSettings();
+    ensureSessionSweeper(settings);
     // Per-provider strategy overrides global setting
     const providerOverride = (settings.providerStrategies || {})[providerId] || {};
-    const strategy = providerOverride.fallbackStrategy || settings.fallbackStrategy || "fill-first";
+    // New scheduling mode wins over the legacy fallbackStrategy when explicitly set
+    // to something other than the legacy values.
+    const legacyStrategy = providerOverride.fallbackStrategy || settings.fallbackStrategy || "fill-first";
+    const schedulingMode = providerOverride.schedulingMode
+      || settings.schedulingMode
+      || legacyStrategy;
+    const strategy = schedulingMode === "quota-weighted" ? "quota-weighted" : legacyStrategy;
+
+    // ---- Concurrency gate + session affinity candidate pruning ----
+    const sessionBindingEnabled = providerOverride.sessionBindingEnabled ?? settings.sessionBindingEnabled ?? true;
+    const maxSessions = providerOverride.maxSessionsPerAccount ?? settings.maxSessionsPerAccount ?? 0;
+    const overflowPolicy = providerOverride.sessionOverflowPolicy || settings.sessionOverflowPolicy || "soft";
+    const maxConcurrent = providerOverride.maxConcurrentPerAccount
+      ?? settings.maxConcurrentPerAccount
+      ?? DEFAULT_MAX_CONCURRENT_PER_ACCOUNT;
+
+    let candidates = availableConnections;
+    let boundConnectionId = null;
+
+    if (sessionBindingEnabled && sessionId) {
+      boundConnectionId = getBoundConnection(providerId, sessionId);
+      if (boundConnectionId) {
+        const bound = candidates.find((c) => c.id === boundConnectionId);
+        if (bound) {
+          // HARD preference: a live session stays on its account — this is what
+          // preserves the provider-side prompt cache.
+          candidates = [bound];
+          log.debug("AUTH", `${provider} | session ${String(sessionId).slice(0, 8)} → bound ${boundConnectionId.slice(0, 8)}`);
+        } else {
+          // Bound account became unavailable/excluded → drop the stale binding and
+          // re-select. bindSession() later will move the session.
+          log.info("AUTH", `${provider} | session ${String(sessionId).slice(0, 8)} bound account ${boundConnectionId.slice(0, 8)} unavailable → rebind`);
+        }
+      }
+    }
 
     let connection;
-    // Pin to preferred connection if specified and available
+    // Pin to preferred connection if specified and available.
+    // Precedence (audit item #10): an explicit hard pin (preferredConnectionId) is a
+    // caller instruction and outranks session affinity; session binding only applies
+    // when no hard pin was requested.
     if (preferredConnectionId) {
-      connection = availableConnections.find((c) => c.id === preferredConnectionId);
+      connection = candidates.find((c) => c.id === preferredConnectionId)
+        || availableConnections.find((c) => c.id === preferredConnectionId);
       if (connection) {
         log.info("AUTH", `${provider} | pinned to ${connection.id?.slice(0, 8)} (${connection.name || connection.email || "unnamed"})`);
       }
     }
+
+    if (!connection && strategy === "quota-weighted") {
+      const { connection: picked, detail } = pickQuotaWeighted(candidates, {
+        // Apply the short-lived optimistic discount so concurrent selectors within
+        // the decay window do not all converge on the same "best" account against a
+        // stale snapshot (audit item #6, snapshot lag stampede).
+        getQuota: withOptimisticDiscount((c) => resolveAccountQuota(c, providerId, model)),
+        weightRemaining: providerOverride.quotaWeightRemaining ?? settings.quotaWeightRemaining ?? 1.0,
+        weightExpiry: providerOverride.quotaWeightExpiry ?? settings.quotaWeightExpiry ?? 0.5,
+        preferEarlierExpiry: providerOverride.quotaPreferEarlierExpiry ?? settings.quotaPreferEarlierExpiry ?? true,
+      });
+      connection = picked;
+      if (connection && detail) {
+        log.debug("AUTH", `${provider} | quota-weighted pick ${connection.id?.slice(0, 8)} score=${detail.score.toFixed(3)} remaining=${detail.remaining ?? "n/a"} msToExpiry=${detail.msUntilExpiry ?? "n/a"}`);
+      }
+    }
+
     if (connection) {
-      // skip strategy
+      // skip strategy (pinned or quota-weighted already chose)
     } else if (strategy === "round-robin") {
       const stickyLimit = providerOverride.stickyRoundRobinLimit || settings.stickyRoundRobinLimit || 3;
 
       // Sort by lastUsed (most recent first) to find current candidate
-      const byRecency = [...availableConnections].sort((a, b) => {
+      const byRecency = [...candidates].sort((a, b) => {
         if (!a.lastUsedAt && !b.lastUsedAt) return (a.priority || 999) - (b.priority || 999);
         if (!a.lastUsedAt) return 1;
         if (!b.lastUsedAt) return -1;
@@ -172,7 +291,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
         });
       } else {
         // Pick the least recently used (excluding current if possible)
-        const sortedByOldest = [...availableConnections].sort((a, b) => {
+        const sortedByOldest = [...candidates].sort((a, b) => {
           if (!a.lastUsedAt && !b.lastUsedAt) return (a.priority || 999) - (b.priority || 999);
           if (!a.lastUsedAt) return -1;
           if (!b.lastUsedAt) return 1;
@@ -188,8 +307,92 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
         });
       }
     } else {
-      // Default: fill-first (already sorted by priority in getProviderConnections)
-      connection = availableConnections[0];
+      // Default: fill-first (already sorted by priority in getProviderConnections).
+      // Respect the per-account session cap so one account does not absorb every
+      // session; fall through to the next candidate when it is at capacity.
+      if (sessionBindingEnabled && sessionId && maxSessions > 0) {
+        const underCap = candidates.find((c) => getSessionCount(c.id) < maxSessions);
+        if (underCap) {
+          connection = underCap;
+        } else if (overflowPolicy === "hard") {
+          connection = null;
+        } else {
+          // soft: allow overflow onto the least-loaded account, but warn.
+          const leastLoaded = [...candidates].sort((a, b) => getSessionCount(a.id) - getSessionCount(b.id))[0];
+          connection = leastLoaded || candidates[0];
+          if (connection) {
+            log.warn("AUTH", `${provider} | all ${candidates.length} accounts at session cap ${maxSessions} (soft overflow) → ${connection.id?.slice(0, 8)} now holds ${getSessionCount(connection.id) + 1}`);
+          }
+        }
+      } else {
+        connection = candidates[0];
+      }
+    }
+
+    // ---- HARD failure: no account could satisfy the (hard-cap) constraints ----
+    if (!connection) {
+      log.warn("AUTH", `${provider} | no account within session/overflow constraints (mode=${strategy}, cap=${maxSessions}, policy=${overflowPolicy})`);
+      return {
+        allRateLimited: true,
+        retryAfter: null,
+        retryAfterHuman: "session capacity",
+        lastError: `all accounts at maxSessionsPerAccount=${maxSessions}`,
+        lastErrorCode: "SESSION_CAPACITY",
+        sessionCapacityExceeded: true,
+      };
+    }
+
+    // ---- Concurrency gate (audit items #2 & #7) ----
+    // Reserved INSIDE the per-provider mutex via a SYNCHRONOUS acquire so two
+    // concurrent selectors cannot both observe "count < max" and both succeed
+    // (the original TOCTOU). If the chosen account is full, walk to the next
+    // candidate that still has a free slot.
+    let slotAcquired = false;
+    if (reserveSlot && connection.id && connection.id !== "noauth") {
+      let gate = acquireAccountSlot(connection.id, maxConcurrent);
+      if (!gate.ok) {
+        log.debug("AUTH", `${provider} | ${connection.id.slice(0, 8)} at concurrency ceiling ${maxConcurrent} → try next candidate`);
+        const alt = candidates
+          .filter((c) => c.id !== connection.id)
+          .map((c) => ({ c, ok: acquireAccountSlot(c.id, maxConcurrent) }))
+          .find((x) => x.ok);
+        if (alt) {
+          connection = alt.c;
+          gate = alt.ok;
+          slotAcquired = true;
+        } else {
+          // Every candidate is saturated right now: this is a concurrency
+          // contention condition, NOT quota exhaustion. Surface it as retryable
+          // so the caller can back off briefly instead of locking accounts.
+          log.warn("AUTH", `${provider} | all ${candidates.length} accounts at concurrency ceiling ${maxConcurrent}`);
+          return {
+            allRateLimited: true,
+            retryAfter: null,
+            retryAfterHuman: "concurrency",
+            lastError: `all accounts at maxConcurrentPerAccount=${maxConcurrent}`,
+            lastErrorCode: "CONCURRENCY_LIMITED",
+            concurrencyLimited: true,
+          };
+        }
+      } else {
+        slotAcquired = true;
+      }
+    }
+
+    // Optimistic consumption: discount this account's apparent remaining quota for
+    // the next few seconds so a concurrent burst spreads instead of converging.
+    if (connection.id && connection.id !== "noauth") {
+      recordConsumption(connection.id, 1);
+    }
+
+    // ---- Record / refresh the session binding ----
+    // Only when the caller actually got a slot (or the account is virtual) so a
+    // failed selection never creates a binding that was never used.
+    if (sessionBindingEnabled && sessionId && connection.id && connection.id !== "noauth" && (slotAcquired || !reserveSlot)) {
+      const { moved } = bindSession(providerId, sessionId, connection.id);
+      if (moved) {
+        log.info("AUTH", `${provider} | session ${String(sessionId).slice(0, 8)} rebound → ${connection.id.slice(0, 8)}`);
+      }
     }
 
     const resolvedProxy = await resolveConnectionProxyConfig(connection.providerSpecificData || {});
@@ -218,6 +421,9 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       // Include current status for optimization check
       testStatus: connection.testStatus,
       lastError: connection.lastError,
+      // True when this selection reserved an in-flight concurrency slot that the
+      // caller MUST release (in a finally block) via releaseAccountSlot().
+      slotReserved: slotAcquired,
       // Pass full connection for clearAccountError to read modelLock_* keys
       _connection: connection
     };
@@ -259,7 +465,11 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
       : Math.min(resetsAtMs - Date.now(), MAX_RATE_LIMIT_COOLDOWN_MS);
     newBackoffLevel = 0;
   } else {
-    ({ shouldFallback, cooldownMs, newBackoffLevel } = checkFallbackError(status, errorText, backoffLevel));
+    const verdict = checkFallbackError(status, errorText, backoffLevel);
+    ({ shouldFallback, cooldownMs, newBackoffLevel } = verdict);
+    // A 429 classified as concurrency contention must NOT lock the account; the
+    // caller retries the same account after a short delay instead.
+    if (verdict.concurrencyLimited) return { shouldFallback: false, cooldownMs: 0, concurrencyLimited: true };
   }
   if (!shouldFallback) return { shouldFallback: false, cooldownMs: 0 };
 
@@ -334,6 +544,20 @@ export async function clearAccountError(connectionId, currentConnection, model =
   }
 
   await updateProviderConnection(connectionId, clearObj);
+}
+
+/**
+ * Release an account concurrency slot previously reserved by getProviderCredentials.
+ * Safe to call unconditionally: it is a no-op when the credentials never reserved a
+ * slot, and the underlying counter clamps at 0 (idempotent on double release).
+ * @param {object|null} credentials - the object returned by getProviderCredentials
+ */
+export function releaseAccountSlot(credentials) {
+  if (!credentials || !credentials.slotReserved) return;
+  const connectionId = credentials.connectionId || credentials.id;
+  if (!connectionId || connectionId === "noauth") return;
+  releaseAccountSlotInternal(connectionId);
+  credentials.slotReserved = false;
 }
 
 /**
