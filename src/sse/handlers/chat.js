@@ -401,6 +401,9 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       excludeConnectionIds.add(credentials.connectionId);
       lastError = result.error || "concurrent request limit reached";
       lastStatus = result.status || HTTP_STATUS.SERVICE_UNAVAILABLE;
+      // The retry budget is per-account: a fresh account deserves the full number of
+      // same-account retries instead of inheriting the previous account's exhaustion.
+      concurrencyAttempts = 0;
       continue;
     }
 
