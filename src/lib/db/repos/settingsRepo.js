@@ -66,9 +66,16 @@ const DEFAULT_SETTINGS = {
   // ---- Session-affinity scheduling (keeps one client session on one account) ----
   // Bind a conversation (session id) to a single upstream account so prompt cache
   // stays warm and concurrency is spread rather than stamped onto one account.
-  sessionBindingEnabled: true,
+  //
+  // Default OFF: this changes account-selection behaviour, and enabling it by
+  // default would silently alter routing for every existing multi-account install
+  // on upgrade (fill-first would stop honouring `priority` as soon as an account
+  // reached the session cap). Opt-in from the Scheduling page instead.
+  sessionBindingEnabled: false,
   // Soft cap: how many distinct sessions may share one account. 0 = unlimited.
-  maxSessionsPerAccount: 3,
+  // Left unlimited by default so that merely turning affinity on does not also
+  // impose a cap the user never asked for.
+  maxSessionsPerAccount: 0,
   // What to do when every account is at/over maxSessionsPerAccount:
   //   "soft" = allow overflow onto the least-loaded account (log a warning)
   //   "hard" = treat as unavailable and fall through to another account / return 429

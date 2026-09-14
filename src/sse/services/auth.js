@@ -1,6 +1,6 @@
 import { getProviderConnections, validateApiKey, updateProviderConnection, getSettings, getProxyPools } from "@/lib/localDb";
 import { resolveConnectionProxyConfig, pickProxyPoolId } from "@/lib/network/connectionProxy";
-import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
+import { formatRetryAfter, checkFallbackError, isConcurrencyLimited, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
 import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
 import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
 import { getAntigravityQuotaCache } from "./antigravityQuota.js";
@@ -27,14 +27,22 @@ function acquireSelectionMutex(providerId) {
   return { current, release };
 }
 
-let sessionSweeperStarted = false;
+// Re-applies the sweeper settings whenever they change.
+//
+// A one-shot `started` boolean would pin the very first values read at startup,
+// so editing "Idle Release (minutes)" / the sweep interval in the dashboard had no
+// effect until the process restarted. startSessionBindingSweeper() is itself a
+// no-op when the parameters are unchanged, so calling this per selection is cheap;
+// we still memoise the last pair to avoid the function-call churn on the hot path.
+let lastSweeperTtl = null;
+let lastSweeperInterval = null;
 function ensureSessionSweeper(settings) {
-  if (sessionSweeperStarted) return;
-  sessionSweeperStarted = true;
-  startSessionBindingSweeper(
-    settings?.sessionIdleTtlMs || 30 * 60 * 1000,
-    settings?.sessionBindingSweepIntervalMs || 5 * 60 * 1000
-  );
+  const ttl = settings?.sessionIdleTtlMs || 30 * 60 * 1000;
+  const interval = settings?.sessionBindingSweepIntervalMs || 5 * 60 * 1000;
+  if (ttl === lastSweeperTtl && interval === lastSweeperInterval) return;
+  lastSweeperTtl = ttl;
+  lastSweeperInterval = interval;
+  startSessionBindingSweeper(ttl, interval);
 }
 
 /**
@@ -215,7 +223,10 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     const strategy = schedulingMode === "quota-weighted" ? "quota-weighted" : legacyStrategy;
 
     // ---- Concurrency gate + session affinity candidate pruning ----
-    const sessionBindingEnabled = providerOverride.sessionBindingEnabled ?? settings.sessionBindingEnabled ?? true;
+    // Default OFF — must match DEFAULT_SETTINGS.sessionBindingEnabled in settingsRepo.js.
+    // A `?? true` here would re-enable affinity for installs whose stored settings
+    // predate the flag, defeating the opt-in default.
+    const sessionBindingEnabled = providerOverride.sessionBindingEnabled ?? settings.sessionBindingEnabled ?? false;
     const maxSessions = providerOverride.maxSessionsPerAccount ?? settings.maxSessionsPerAccount ?? 0;
     const overflowPolicy = providerOverride.sessionOverflowPolicy || settings.sessionOverflowPolicy || "soft";
     const maxConcurrent = providerOverride.maxConcurrentPerAccount
@@ -260,6 +271,24 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
         || availableConnections.find((c) => c.id === preferredConnectionId);
       if (connection) {
         log.info("AUTH", `${provider} | pinned to ${connection.id?.slice(0, 8)} (${connection.name || connection.email || "unnamed"})`);
+      }
+    }
+
+    // ---- Session affinity short-circuit (applies to ALL scheduling modes) ----
+    // The bound account is only moved to the FRONT of `candidates` above, which is
+    // enough for fill-first but is silently discarded by round-robin (sorts by
+    // lastUsedAt) and quota-weighted (sorts by score). Since the UI lets affinity be
+    // combined with any mode, honour it here: if the session already has a healthy
+    // bound account with capacity, reuse it regardless of mode. That is the entire
+    // point of affinity — keeping the upstream prompt cache warm.
+    //
+    // The concurrency gate below can still fail over to another candidate if this
+    // account turns out to be saturated, so this is a preference, not a pin.
+    if (!connection && sessionBindingEnabled && sessionId && boundConnection) {
+      const atSessionCap = maxSessions > 0 && getSessionCount(boundConnection.id) > maxSessions;
+      if (!atSessionCap) {
+        connection = boundConnection;
+        log.debug("AUTH", `${provider} | session affinity honoured in mode=${strategy} → ${boundConnection.id.slice(0, 8)}`);
       }
     }
 
@@ -429,7 +458,17 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       }
     }
 
-    const resolvedProxy = await resolveConnectionProxyConfig(connection.providerSpecificData || {});
+    // Anything that can throw AFTER a slot was reserved must release it, otherwise
+    // the credentials object never reaches the caller and its finally-block can never
+    // call releaseAccountSlot() — the count would leak permanently and the account
+    // would look saturated forever, cascading into bogus CONCURRENCY_LIMITED errors.
+    let resolvedProxy;
+    try {
+      resolvedProxy = await resolveConnectionProxyConfig(connection.providerSpecificData || {});
+    } catch (err) {
+      if (slotAcquired) releaseAccountSlotInternal(connection.id);
+      throw err;
+    }
 
     return {
       authType: connection.authType,
@@ -478,6 +517,24 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
  */
 export async function markAccountUnavailable(connectionId, status, errorText, provider = null, model = null, resetsAtMs = null) {
   if (!connectionId || connectionId === "noauth") return { shouldFallback: false, cooldownMs: 0 };
+
+  // A 429 caused by per-account CONCURRENCY limits must be short-circuited before
+  // anything else. It is a contention signal, not quota exhaustion: the account is
+  // still perfectly usable once an in-flight request drains.
+  //
+  // This check must come before the githubResetAtMs / resetsAtMs branches, not after.
+  // Providers commonly attach `Retry-After` to concurrency rejections too, which
+  // makes `resetsAtMs` truthy — so a check placed in the trailing `else` would
+  // never be reached for exactly the traffic it was written for, and the account
+  // would be locked for the full retry window.
+  //
+  // Returning early also guarantees we perform NO DB write here, which keeps this
+  // function side-effect free on the concurrency path (callers may probe it before
+  // deciding whether to retry).
+  if (isConcurrencyLimited(status, errorText)) {
+    return { shouldFallback: false, cooldownMs: 0, concurrencyLimited: true };
+  }
+
   const connections = await getProviderConnections({ provider });
   const conn = connections.find(c => c.id === connectionId);
   const backoffLevel = conn?.backoffLevel || 0;
@@ -499,11 +556,7 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
       : Math.min(resetsAtMs - Date.now(), MAX_RATE_LIMIT_COOLDOWN_MS);
     newBackoffLevel = 0;
   } else {
-    const verdict = checkFallbackError(status, errorText, backoffLevel);
-    ({ shouldFallback, cooldownMs, newBackoffLevel } = verdict);
-    // A 429 classified as concurrency contention must NOT lock the account; the
-    // caller retries the same account after a short delay instead.
-    if (verdict.concurrencyLimited) return { shouldFallback: false, cooldownMs: 0, concurrencyLimited: true };
+    ({ shouldFallback, cooldownMs, newBackoffLevel } = checkFallbackError(status, errorText, backoffLevel));
   }
   if (!shouldFallback) return { shouldFallback: false, cooldownMs: 0 };
 

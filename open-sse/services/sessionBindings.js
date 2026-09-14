@@ -24,16 +24,24 @@ import { drainLoad, getLoad } from "./accountLoad.js";
 const DEFAULT_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_SWEEP_MS = 5 * 60 * 1000;
 
+/**
+ * Hard ceiling on tracked sessions. The TTL sweep alone is not enough: clients
+ * that mint a fresh session id per request (e.g. a rotating prompt_cache_key)
+ * would grow this Map monotonically for a full TTL window. When the ceiling is
+ * hit we evict the least-recently-seen entries, which is exactly the set whose
+ * upstream prompt cache is most likely already cold.
+ */
+const MAX_BINDINGS = 20000;
+const EVICT_BATCH = 2000;
+
 // sessionKey (providerId + "\u0000" + sessionId) -> { connectionId, providerId, sessionId, lastSeenAt, createdAt }
 const bindings = new Map();
 // connectionId -> Set<sessionKey>
 const byConnection = new Map();
 
-let lastSeenMap = new WeakMap(); // reserved for future use
-void lastSeenMap;
-
 let sweepTimer = null;
 let sweepTtlMs = DEFAULT_TTL_MS;
+let sweepIntervalMs = DEFAULT_SWEEP_MS;
 
 function sessionKey(providerId, sessionId) {
   return `${providerId}\u0000${sessionId}`;
@@ -41,6 +49,30 @@ function sessionKey(providerId, sessionId) {
 
 function touch(entry) {
   entry.lastSeenAt = Date.now();
+}
+
+/** Detach a key from its connection index, cleaning up empty sets. */
+function detachKey(key, connectionId) {
+  const set = byConnection.get(connectionId);
+  if (!set) return;
+  set.delete(key);
+  if (set.size === 0) byConnection.delete(connectionId);
+}
+
+/**
+ * Evict the least-recently-seen bindings once the hard ceiling is reached.
+ * O(n log n) but amortised: only runs when the Map is already at MAX_BINDINGS.
+ */
+function evictLeastRecentlyUsed() {
+  if (bindings.size < MAX_BINDINGS) return 0;
+  const entries = [...bindings.entries()].sort((a, b) => a[1].lastSeenAt - b[1].lastSeenAt);
+  const target = Math.min(EVICT_BATCH, entries.length);
+  for (let i = 0; i < target; i += 1) {
+    const [key, entry] = entries[i];
+    bindings.delete(key);
+    detachKey(key, entry.connectionId);
+  }
+  return target;
 }
 
 /**
@@ -92,6 +124,10 @@ export function bindSession(providerId, sessionId, connectionId) {
     }
   }
 
+  // Enforce the ceiling only when inserting a genuinely new key, so refreshing an
+  // existing hot session never triggers an eviction pass.
+  if (!existing) evictLeastRecentlyUsed();
+
   const now = Date.now();
   bindings.set(key, {
     connectionId,
@@ -121,11 +157,7 @@ export function unbindSession(providerId, sessionId) {
   const entry = bindings.get(key);
   if (!entry) return false;
   bindings.delete(key);
-  const set = byConnection.get(entry.connectionId);
-  if (set) {
-    set.delete(key);
-    if (set.size === 0) byConnection.delete(entry.connectionId);
-  }
+  detachKey(key, entry.connectionId);
   return true;
 }
 
@@ -150,29 +182,36 @@ export function sweepIdleBindings(ttlMs = sweepTtlMs) {
   for (const [key, entry] of bindings) {
     if (now - entry.lastSeenAt > ttlMs) {
       bindings.delete(key);
-      const set = byConnection.get(entry.connectionId);
-      if (set) {
-        set.delete(key);
-        if (set.size === 0) byConnection.delete(entry.connectionId);
-      }
+      detachKey(key, entry.connectionId);
       evicted += 1;
     }
   }
   return evicted;
 }
 
-/** Start the periodic idle sweep (idempotent). */
+/**
+ * Start (or re-arm) the periodic idle sweep.
+ *
+ * Idempotent for identical parameters, but a CHANGED ttl/interval restarts the
+ * timer. Without this, a user editing "Idle Release (minutes)" in the UI would
+ * see no effect until the process restarted.
+ */
 export function startSessionBindingSweeper(ttlMs = DEFAULT_TTL_MS, intervalMs = DEFAULT_SWEEP_MS) {
-  sweepTtlMs = ttlMs > 0 ? ttlMs : DEFAULT_TTL_MS;
-  if (sweepTimer) return;
-  const every = intervalMs > 0 ? intervalMs : DEFAULT_SWEEP_MS;
+  const nextTtl = ttlMs > 0 ? ttlMs : DEFAULT_TTL_MS;
+  const nextInterval = intervalMs > 0 ? intervalMs : DEFAULT_SWEEP_MS;
+  if (sweepTimer && nextTtl === sweepTtlMs && nextInterval === sweepIntervalMs) return;
+
+  sweepTtlMs = nextTtl;
+  sweepIntervalMs = nextInterval;
+  if (sweepTimer) clearInterval(sweepTimer);
+
   sweepTimer = setInterval(() => {
     try {
       sweepIdleBindings();
     } catch {
       /* never let the sweeper crash the process */
     }
-  }, every);
+  }, sweepIntervalMs);
   if (typeof sweepTimer.unref === "function") sweepTimer.unref();
 }
 
@@ -187,7 +226,13 @@ export function stopSessionBindingSweeper() {
 export function snapshotBindings() {
   const byConn = {};
   for (const [cid, set] of byConnection) byConn[cid] = set.size;
-  return { totalSessions: bindings.size, connections: Object.keys(byConn).length, byConnection: byConn };
+  return {
+    totalSessions: bindings.size,
+    connections: Object.keys(byConn).length,
+    byConnection: byConn,
+    capacity: MAX_BINDINGS,
+    ttlMs: sweepTtlMs,
+  };
 }
 
 /** Test helper. */

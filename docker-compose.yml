@@ -1,6 +1,6 @@
 services:
   9router:
-    image: ghcr.io/pikachuim/9router:latest
+    image: decolua/9router:latest
     container_name: 9router
     restart: always
     ports:

@@ -21,6 +21,13 @@ export function toResponsesUsage(usage) {
   const inputTokens = usage.prompt_tokens ?? 0;
   const outputTokens = usage.completion_tokens ?? 0;
   const totalTokens = usage.total_tokens ?? (inputTokens + outputTokens);
+
+  // An all-zero usage object is indistinguishable from "this request was free".
+  // Emitting it makes downstream billing record 0 tokens for a real completion,
+  // which is worse than omitting the field entirely — a missing `usage` lets the
+  // consumer fall back to its own estimation, a zeroed one silently does not.
+  if (inputTokens <= 0 && outputTokens <= 0 && totalTokens <= 0) return null;
+
   const result = { input_tokens: inputTokens, output_tokens: outputTokens, total_tokens: totalTokens };
 
   const cached = usage.prompt_tokens_details?.cached_tokens;

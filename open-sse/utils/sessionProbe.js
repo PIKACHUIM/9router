@@ -72,7 +72,27 @@ const stats = {
 
 function hashShort(value) {
   if (value === null || value === undefined) return null;
-  return createHash("sha256").update(String(value)).digest("hex").slice(0, 16);
+  // Only hash a bounded prefix: callers pass whole user messages here, and digesting
+  // a multi-megabyte prompt on every request is pure waste. 512 chars is far more
+  // than enough entropy to tell conversations apart.
+  return createHash("sha256").update(String(value).slice(0, 512)).digest("hex").slice(0, 16);
+}
+
+/**
+ * Read a header from any of the shapes callers realistically pass in:
+ * a WHATWG `Headers` instance (has .get), a `Map`, or a plain lowercased object.
+ *
+ * This matters: `Headers` does NOT support property indexing, so the previous
+ * `headers["user-agent"]` access silently produced `undefined` for every real
+ * request and the transport dimension was always empty.
+ */
+function readHeader(headers, name) {
+  if (!headers) return "";
+  if (typeof headers.get === "function") return headers.get(name) || "";
+  const direct = headers[name];
+  if (typeof direct === "string") return direct;
+  if (Array.isArray(direct)) return direct[0] || "";
+  return "";
 }
 
 function firstUserMessageText(body) {
@@ -108,7 +128,7 @@ function conversationIdFrom(body) {
  * @param {{sessionId: string, ephemeral: boolean, stable: boolean}} p.identity - result of resolveSessionIdentity()
  * @param {string|null} p.level - which level produced the identity (see LEVELS)
  * @param {object} p.body - request body
- * @param {object} p.headers - request headers (lowercased keys)
+ * @param {object} p.headers - request headers: a `Headers` instance, a Map, or a plain lowercased object
  * @param {string|null} p.connectionId
  * @param {string|null} p.clientKey - api key id / account identifier for transport fingerprint
  */
@@ -119,12 +139,14 @@ export function recordSessionProbe({ identity, level, body, headers = {}, connec
     if (level && stats.levelHits[level] !== undefined) stats.levelHits[level] += 1;
 
     const now = Date.now();
+    const userAgent = readHeader(headers, "user-agent");
+    const clientName = readHeader(headers, "x-client-name");
     const candidateValues = {
       conversationId: conversationIdFrom(body) || null,
       firstUserMsg: firstUserMessageText(body) || null,
       transport:
-        headers["user-agent"] || headers["x-client-name"]
-          ? `${clientKey || connectionId || "?"}|${headers["user-agent"] || ""}|${headers["x-client-name"] || ""}`
+        userAgent || clientName
+          ? `${clientKey || connectionId || "?"}|${userAgent}|${clientName}`
           : null,
       clientSessionId: identity?.sessionId && identity?.stable && level === "client" ? identity.sessionId : null,
     };
