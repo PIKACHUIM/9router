@@ -94,8 +94,14 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
   // per-conversation id (see open-sse/utils/sessionManager.js resolveSessionIdentity).
   const sessionId = options?.sessionId || null;
   // Whether the caller wants a concurrency slot reserved for this selection.
-  // Retries / internal fan-out may pass reserveSlot=false to avoid double-counting.
-  const reserveSlot = options?.reserveSlot !== false;
+  //
+  // This is OPT-IN on purpose. A reserved slot must be released by the caller via
+  // releaseAccountSlot(); any caller that acquires without releasing would leak the
+  // counter permanently, eventually making every account look saturated and
+  // cascading into spurious CONCURRENCY_LIMITED responses. Only callers that
+  // actually manage the slot lifecycle in a try/finally (currently chat.js) pass
+  // reserveSlot: true.
+  const reserveSlot = options?.reserveSlot === true;
   // Resolve alias to provider ID (e.g., "kc" -> "kilocode") BEFORE taking the lock
   // so the shard key is stable regardless of alias spelling.
   const providerId = resolveProviderId(provider);
