@@ -6,7 +6,7 @@ import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.
 import { getAntigravityQuotaCache } from "./antigravityQuota.js";
 import { acquire as acquireAccountSlot, release as releaseAccountSlotInternal, DEFAULT_MAX_CONCURRENT_PER_ACCOUNT } from "open-sse/services/accountLoad.js";
 import { getBoundConnection, bindSession, getSessionCount, startSessionBindingSweeper } from "open-sse/services/sessionBindings.js";
-import { pickQuotaWeighted, withOptimisticDiscount, recordConsumption } from "open-sse/services/quotaScheduler.js";
+import { pickQuotaWeighted, withOptimisticDiscount, recordConsumption, releaseConsumption } from "open-sse/services/quotaScheduler.js";
 import * as log from "../utils/logger.js";
 
 // Mutex to prevent race conditions during account selection.
@@ -444,8 +444,10 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     // Only meaningful for quota-weighted scoring — the discount is read exclusively
     // by withOptimisticDiscount(), so recording it in other modes would just grow
     // an unused map.
+    let discountApplied = false;
     if (strategy === "quota-weighted" && connection.id && connection.id !== "noauth") {
       recordConsumption(connection.id, 1);
+      discountApplied = true;
     }
 
     // ---- Record / refresh the session binding ----
@@ -462,11 +464,14 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     // the credentials object never reaches the caller and its finally-block can never
     // call releaseAccountSlot() — the count would leak permanently and the account
     // would look saturated forever, cascading into bogus CONCURRENCY_LIMITED errors.
+    // The optimistic discount is rolled back for the same reason: no request was
+    // ever issued, so nothing was consumed.
     let resolvedProxy;
     try {
       resolvedProxy = await resolveConnectionProxyConfig(connection.providerSpecificData || {});
     } catch (err) {
       if (slotAcquired) releaseAccountSlotInternal(connection.id);
+      if (discountApplied) releaseConsumption(connection.id, 1);
       throw err;
     }
 
@@ -497,6 +502,10 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       // True when this selection reserved an in-flight concurrency slot that the
       // caller MUST release (in a finally block) via releaseAccountSlot().
       slotReserved: slotAcquired,
+      // True when a short-lived optimistic quota discount was applied for this
+      // selection. Callers that abandon the attempt without consuming quota should
+      // refund it via refundAccountQuotaDiscount().
+      quotaDiscountApplied: discountApplied,
       // Pass full connection for clearAccountError to read modelLock_* keys
       _connection: connection
     };
@@ -645,6 +654,31 @@ export function releaseAccountSlot(credentials) {
   if (!connectionId || connectionId === "noauth") return;
   releaseAccountSlotInternal(connectionId);
   credentials.slotReserved = false;
+}
+
+/**
+ * Refund the optimistic quota discount applied when these credentials were
+ * selected.
+ *
+ * Call this when the attempt is abandoned WITHOUT consuming upstream quota — a
+ * concurrency-429 retry or a failover to a different account. Leaving the
+ * discount in place would make a healthy account look emptier than it is for the
+ * rest of the 30s decay window and steer later selections away from it.
+ *
+ * Do NOT call it after a request that actually reached the provider: that one did
+ * consume quota, and the discount is exactly the signal we want to keep.
+ *
+ * Safe to call unconditionally — it is a no-op when no discount was applied, and
+ * the flag is cleared so a double call cannot over-refund.
+ *
+ * @param {object|null} credentials - the object returned by getProviderCredentials
+ */
+export function refundAccountQuotaDiscount(credentials) {
+  if (!credentials || !credentials.quotaDiscountApplied) return;
+  const connectionId = credentials.connectionId || credentials.id;
+  if (!connectionId || connectionId === "noauth") return;
+  releaseConsumption(connectionId, 1);
+  credentials.quotaDiscountApplied = false;
 }
 
 /**

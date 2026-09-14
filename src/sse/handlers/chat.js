@@ -7,6 +7,7 @@ import {
   extractApiKey,
   isValidApiKey,
   releaseAccountSlot,
+  refundAccountQuotaDiscount,
 } from "../services/auth.js";
 import { handleAntigravityQuotaError, clearAntigravityStrikes } from "../services/antigravityQuota.js";
 import { getSettings } from "@/lib/localDb";
@@ -386,11 +387,16 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     // Antigravity quota refresh below would both double-write the lock and violate the
     // invariant that the Antigravity quota path must NOT persist a modelLock_*.
     if (isConcurrencyLimited(result.status, result.error)) {
+      // The provider rejected the call outright, so no quota was consumed: refund
+      // the optimistic discount applied at selection time. Without this, a burst of
+      // concurrency-429s would make a perfectly healthy account look progressively
+      // emptier and steer quota-weighted scoring away from it for 30s.
       if (concurrencyAttempts < CONCURRENCY_RETRY_MAX) {
         const delay = getConcurrencyRetryDelay(concurrencyAttempts);
         concurrencyAttempts += 1;
         log.warn("CHAT", `[${provider}/${model}] 429 concurrency-limited on ${credentials.connectionName} — retry same account ${concurrencyAttempts}/${CONCURRENCY_RETRY_MAX} in ${delay}ms`);
         releaseAccountSlot(credentials);
+        refundAccountQuotaDiscount(credentials);
         heldCredentials = null;
         await new Promise((r) => setTimeout(r, delay));
         continue;
@@ -398,6 +404,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       // Exhausted same-account retries → fall through to fail over to another account.
       log.warn("CHAT", `[${provider}/${model}] 429 concurrency-limited, retries exhausted → failing over`);
       releaseAccountSlot(credentials);
+      refundAccountQuotaDiscount(credentials);
       heldCredentials = null;
       excludeConnectionIds.add(credentials.connectionId);
       lastError = result.error || "concurrent request limit reached";
