@@ -264,7 +264,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     }
 
     if (!connection && strategy === "quota-weighted") {
-      const { connection: picked, detail } = pickQuotaWeighted(candidates, {
+      const { connection: picked, score, detail } = pickQuotaWeighted(candidates, {
         // Apply the short-lived optimistic discount so concurrent selectors within
         // the decay window do not all converge on the same "best" account against a
         // stale snapshot (audit item #6, snapshot lag stampede).
@@ -275,7 +275,8 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       });
       connection = picked;
       if (connection && detail) {
-        log.debug("AUTH", `${provider} | quota-weighted pick ${connection.id?.slice(0, 8)} score=${detail.score.toFixed(3)} remaining=${detail.remaining ?? "n/a"} msToExpiry=${detail.msUntilExpiry ?? "n/a"}`);
+        const scoreText = Number.isFinite(score) ? score.toFixed(3) : "n/a";
+        log.debug("AUTH", `${provider} | quota-weighted pick ${connection.id?.slice(0, 8)} score=${scoreText} remaining=${detail.remaining ?? "n/a"} msToExpiry=${detail.msUntilExpiry ?? "n/a"}`);
       }
     }
 
