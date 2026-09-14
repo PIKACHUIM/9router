@@ -129,12 +129,17 @@ export function scoreAccounts(candidates, opts = {}) {
 
 /**
  * Pick the single best account by quota-weighted score.
- * @returns {{ connection: object|null, detail: object|null }}
+ *
+ * `score` is returned alongside `detail` because callers log it; it lives on the
+ * scored entry (a sibling of `detail`), not inside `detail`.
+ *
+ * @returns {{ connection: object|null, score: number|null, detail: object|null }}
  */
 export function pickQuotaWeighted(candidates, opts = {}) {
-  if (!candidates || candidates.length === 0) return { connection: null, detail: null };
+  if (!candidates || candidates.length === 0) return { connection: null, score: null, detail: null };
   const ranked = scoreAccounts(candidates, opts);
-  return { connection: ranked[0].connection, detail: ranked[0].detail };
+  const best = ranked[0];
+  return { connection: best.connection, score: best.score, detail: best.detail };
 }
 
 // ---------------------------------------------------------------------------
