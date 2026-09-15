@@ -112,9 +112,14 @@ async function main() {
     quota = { remaining, total, resetAt };
   }
 
+  // Send ONLY the quota key. PUT /api/providers/[id] already merges
+  // `providerSpecificData` over the stored object server-side, so echoing back the
+  // whole blob we read from the API is both unnecessary and unsafe: the read path
+  // strips/redacts sensitive fields, and writing that redacted copy back would
+  // clobber the real stored credentials.
   await api(base, token, `/api/providers/${encodeURIComponent(target.id)}`, {
     method: "PUT",
-    body: JSON.stringify({ providerSpecificData: { ...existing, quota } }),
+    body: JSON.stringify({ providerSpecificData: { quota } }),
   });
 
   console.log(

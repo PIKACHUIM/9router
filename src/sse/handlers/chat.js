@@ -7,6 +7,7 @@ import {
   extractApiKey,
   isValidApiKey,
   releaseAccountSlot,
+  refundAccountQuotaDiscount,
 } from "../services/auth.js";
 import { handleAntigravityQuotaError, clearAntigravityStrikes } from "../services/antigravityQuota.js";
 import { getSettings } from "@/lib/localDb";
@@ -27,7 +28,7 @@ import { getProjectIdForConnection } from "open-sse/services/projectId.js";
 import { stripModelContextMarker } from "open-sse/utils/modelMarkers.js";
 import { captureSessionIdentity } from "open-sse/utils/sessionManager.js";
 import { recordSessionProbe, isSessionProbeEnabled } from "open-sse/utils/sessionProbe.js";
-import { getConcurrencyRetryDelay, CONCURRENCY_RETRY_MAX } from "open-sse/services/accountFallback.js";
+import { getConcurrencyRetryDelay, CONCURRENCY_RETRY_MAX, isConcurrencyLimited } from "open-sse/services/accountFallback.js";
 
 /**
  * Handle chat completion request
@@ -376,28 +377,35 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       return result.response;
     }
 
-    // Classify the failure once. markAccountUnavailable() will NOT lock the
-    // account when the 429 is pure concurrency contention (it returns
-    // `concurrencyLimited: true` and leaves the account untouched).
-    const verdict = await markAccountUnavailable(
-      credentials.connectionId, result.status, result.error, provider, model, result.resetsAtMs
-    );
-
     // Concurrency-429: the account is healthy, it is simply serving too many
     // parallel requests. Retry the SAME account after a short jittered delay so it
     // stays warm (and keeps its prompt cache) instead of being excluded for minutes.
-    if (verdict.concurrencyLimited) {
+    //
+    // This is classified with the PURE `isConcurrencyLimited()` predicate rather than
+    // by calling markAccountUnavailable() early. markAccountUnavailable() has side
+    // effects (it writes modelLock_* and bumps backoffLevel), so hoisting it above the
+    // Antigravity quota refresh below would both double-write the lock and violate the
+    // invariant that the Antigravity quota path must NOT persist a modelLock_*.
+    if (isConcurrencyLimited(result.status, result.error)) {
+      // The provider rejected the call outright, so no quota was consumed: refund
+      // the optimistic discount applied at selection time. Without this, a burst of
+      // concurrency-429s would make a perfectly healthy account look progressively
+      // emptier and steer quota-weighted scoring away from it for 30s.
       if (concurrencyAttempts < CONCURRENCY_RETRY_MAX) {
         const delay = getConcurrencyRetryDelay(concurrencyAttempts);
         concurrencyAttempts += 1;
         log.warn("CHAT", `[${provider}/${model}] 429 concurrency-limited on ${credentials.connectionName} — retry same account ${concurrencyAttempts}/${CONCURRENCY_RETRY_MAX} in ${delay}ms`);
         releaseAccountSlot(credentials);
+        refundAccountQuotaDiscount(credentials);
+        heldCredentials = null;
         await new Promise((r) => setTimeout(r, delay));
         continue;
       }
       // Exhausted same-account retries → fall through to fail over to another account.
       log.warn("CHAT", `[${provider}/${model}] 429 concurrency-limited, retries exhausted → failing over`);
       releaseAccountSlot(credentials);
+      refundAccountQuotaDiscount(credentials);
+      heldCredentials = null;
       excludeConnectionIds.add(credentials.connectionId);
       lastError = result.error || "concurrent request limit reached";
       lastStatus = result.status || HTTP_STATUS.SERVICE_UNAVAILABLE;
@@ -420,19 +428,18 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
 
     // Exhausted Antigravity model is blocked only in RAM cache until upstream resetAt.
     // Do not persist a modelLock_* for this path.
-    // Reuse the verdict computed above unless antigravity refreshed a more precise
-    // resetsAtMs, in which case re-evaluate with it (avoids a duplicate lock write).
     const shouldFallback = provider === "antigravity" && quotaResetMs
       ? true
-      : (resetsAtMs !== result.resetsAtMs
-        ? (await markAccountUnavailable(credentials.connectionId, result.status, result.error, provider, model, resetsAtMs)).shouldFallback
-        : verdict.shouldFallback);
+      : (await markAccountUnavailable(
+          credentials.connectionId, result.status, result.error, provider, model, resetsAtMs
+        )).shouldFallback;
 
     if (shouldFallback) {
       log.warn("FALLBACK", `⇄ ACC:${credentials.connectionName} UNAVAILABLE (${result.status}) → NEXT ACCOUNT`);
       // Free this account's concurrency slot before excluding it, otherwise the
       // counter would leak and permanently look saturated.
       releaseAccountSlot(credentials);
+      heldCredentials = null;
       excludeConnectionIds.add(credentials.connectionId);
       lastError = result.error;
       lastStatus = result.status;

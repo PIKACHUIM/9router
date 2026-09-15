@@ -209,7 +209,48 @@ export function withOptimisticDiscount(getQuota) {
   };
 }
 
+/**
+ * Roll back a previously recorded optimistic consumption.
+ *
+ * `recordConsumption` is applied at SELECTION time, before we know whether the
+ * request will actually consume anything. When the attempt fails without
+ * consuming quota (a concurrency-429 retry, or a failover to another account),
+ * the discount is stale: it makes a perfectly healthy account look emptier than
+ * it is for the remainder of the decay window, biasing subsequent selections
+ * away from it for no reason.
+ *
+ * Refunding keeps the optimistic view honest. The counter is clamped at zero and
+ * the entry is dropped when it reaches zero, so an unmatched refund can never
+ * drive the discount negative (which would make an account look artificially
+ * attractive).
+ *
+ * @param {string} connectionId
+ * @param {number} [cost=1] - units to refund; must mirror the recorded cost
+ */
+export function releaseConsumption(connectionId, cost = 1) {
+  if (!connectionId) return;
+  const e = optimistic.get(connectionId);
+  if (!e) return;
+  if (e.expiresAt <= Date.now()) {
+    // Already decayed; nothing to refund.
+    optimistic.delete(connectionId);
+    return;
+  }
+  e.used -= cost;
+  if (e.used <= 0) {
+    optimistic.delete(connectionId);
+    return;
+  }
+  optimistic.set(connectionId, e);
+}
+
 /** Clear optimistic state (test helper / maintenance). */
 export function resetOptimistic() {
   optimistic.clear();
+}
+
+/** Current optimistic discount units for a connection (diagnostics / tests). */
+export function getOptimisticUsed(connectionId) {
+  if (!connectionId) return 0;
+  return optimisticUsed(connectionId, Date.now());
 }

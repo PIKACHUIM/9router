@@ -1,12 +1,12 @@
 import { getProviderConnections, validateApiKey, updateProviderConnection, getSettings, getProxyPools } from "@/lib/localDb";
 import { resolveConnectionProxyConfig, pickProxyPoolId } from "@/lib/network/connectionProxy";
-import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
+import { formatRetryAfter, checkFallbackError, isConcurrencyLimited, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
 import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
 import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
 import { getAntigravityQuotaCache } from "./antigravityQuota.js";
 import { acquire as acquireAccountSlot, release as releaseAccountSlotInternal, getLoad, DEFAULT_MAX_CONCURRENT_PER_ACCOUNT } from "open-sse/services/accountLoad.js";
 import { getBoundConnection, bindSession, getSessionCount, startSessionBindingSweeper } from "open-sse/services/sessionBindings.js";
-import { pickQuotaWeighted, withOptimisticDiscount, recordConsumption } from "open-sse/services/quotaScheduler.js";
+import { pickQuotaWeighted, withOptimisticDiscount, recordConsumption, releaseConsumption } from "open-sse/services/quotaScheduler.js";
 import * as log from "../utils/logger.js";
 
 // Mutex to prevent race conditions during account selection.
@@ -27,14 +27,22 @@ function acquireSelectionMutex(providerId) {
   return { current, release };
 }
 
-let sessionSweeperStarted = false;
+// Re-applies the sweeper settings whenever they change.
+//
+// A one-shot `started` boolean would pin the very first values read at startup,
+// so editing "Idle Release (minutes)" / the sweep interval in the dashboard had no
+// effect until the process restarted. startSessionBindingSweeper() is itself a
+// no-op when the parameters are unchanged, so calling this per selection is cheap;
+// we still memoise the last pair to avoid the function-call churn on the hot path.
+let lastSweeperTtl = null;
+let lastSweeperInterval = null;
 function ensureSessionSweeper(settings) {
-  if (sessionSweeperStarted) return;
-  sessionSweeperStarted = true;
-  startSessionBindingSweeper(
-    settings?.sessionIdleTtlMs || 30 * 60 * 1000,
-    settings?.sessionBindingSweepIntervalMs || 5 * 60 * 1000
-  );
+  const ttl = settings?.sessionIdleTtlMs || 30 * 60 * 1000;
+  const interval = settings?.sessionBindingSweepIntervalMs || 5 * 60 * 1000;
+  if (ttl === lastSweeperTtl && interval === lastSweeperInterval) return;
+  lastSweeperTtl = ttl;
+  lastSweeperInterval = interval;
+  startSessionBindingSweeper(ttl, interval);
 }
 
 /**
@@ -215,7 +223,10 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     const strategy = schedulingMode === "quota-weighted" ? "quota-weighted" : legacyStrategy;
 
     // ---- Concurrency gate + session affinity candidate pruning ----
-    const sessionBindingEnabled = providerOverride.sessionBindingEnabled ?? settings.sessionBindingEnabled ?? true;
+    // Default OFF — must match DEFAULT_SETTINGS.sessionBindingEnabled in settingsRepo.js.
+    // A `?? true` here would re-enable affinity for installs whose stored settings
+    // predate the flag, defeating the opt-in default.
+    const sessionBindingEnabled = providerOverride.sessionBindingEnabled ?? settings.sessionBindingEnabled ?? false;
     const maxSessions = providerOverride.maxSessionsPerAccount ?? settings.maxSessionsPerAccount ?? 0;
     const overflowPolicy = providerOverride.sessionOverflowPolicy || settings.sessionOverflowPolicy || "soft";
     const maxConcurrent = providerOverride.maxConcurrentPerAccount
@@ -250,6 +261,49 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       }
     }
 
+    // ---- New-session capacity shaping (all scheduling modes) ----
+    // A session without a binding must consume the WHOLE enabled pool before any
+    // account is pushed past maxSessionsPerAccount: the cap is a limit on how many
+    // distinct conversations an account absorbs, so an account already at its cap
+    // must not be chosen while accounts below it still have room.
+    //
+    // Rather than intercepting each mode's pick afterwards (which would also strand
+    // round-robin's lastUsedAt write on the wrong account), the full candidates are
+    // reordered so under-cap accounts come first. Every mode downstream then naturally
+    // prefers them, and a cap-full account only gets selected when nothing else is
+    // left — which is exactly when the soft/hard overflow policy should apply. The
+    // bound account is exempt because reusing it cannot grow its session count.
+    if (sessionBindingEnabled && sessionId && !boundConnection && maxSessions > 0) {
+      const underCap = [];
+      const atCap = [];
+      for (const c of candidates) {
+        if (getSessionCount(c.id) < maxSessions) underCap.push(c);
+        else atCap.push(c);
+      }
+      // Least-loaded first WITHIN each group is what spreads the pool, but priority
+      // must still win so an operator's ordering is respected:
+      //   under-cap: priority ASC, then load ASC, then id (stable, deterministic)
+      //   at-cap:    load ASC (this feeds the soft-overflow pick), then priority ASC
+      const byPriority = (a, b) =>
+        (Number(a.priority) || 0) - (Number(b.priority) || 0) ||
+        String(a.id).localeCompare(String(b.id));
+      underCap.sort(
+        (a, b) => getSessionCount(a.id) - getSessionCount(b.id) || byPriority(a, b)
+      );
+      atCap.sort(
+        (a, b) => getSessionCount(a.id) - getSessionCount(b.id) || byPriority(a, b)
+      );
+      if (atCap.length) {
+        log.debug(
+          "AUTH",
+          `${provider} | new session ${String(sessionId).slice(0, 8)}: ${underCap.length} account(s) under cap, ${atCap.length} at cap (pool full) → under-cap first`
+        );
+      }
+      // Under-cap accounts always come first so the whole pool is consumed before the
+      // cap is exceeded; the overflow policy below only fires if `underCap` is empty.
+      candidates = [...underCap, ...atCap];
+    }
+
     let connection;
     // Pin to preferred connection if specified and available.
     // Precedence (audit item #10): an explicit hard pin (preferredConnectionId) is a
@@ -261,6 +315,31 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       if (connection) {
         log.info("AUTH", `${provider} | pinned to ${connection.id?.slice(0, 8)} (${connection.name || connection.email || "unnamed"})`);
       }
+    }
+
+    // ---- Session affinity short-circuit (applies to ALL scheduling modes) ----
+    // The bound account is only moved to the FRONT of `candidates` above, which is
+    // enough for fill-first but is silently discarded by round-robin (sorts by
+    // lastUsedAt) and quota-weighted (sorts by score). Since the UI lets affinity be
+    // combined with any mode, honour it here: if the session already has a healthy
+    // bound account, reuse it regardless of mode. That is the entire point of
+    // affinity — keeping the upstream prompt cache warm.
+    //
+    // The concurrency gate below can still fail over to another candidate if this
+    // account turns out to be saturated, so this is a preference, not a pin.
+    //
+    // Session-cap interaction: reusing the bound account does NOT grow its session
+    // count (getBoundConnection() only returns an account that already holds this
+    // session), so a bound account at its cap should NOT be treated as full for THIS
+    // session — evicting it here would rebind an established conversation to a cold
+    // account on every request, destroying the prompt cache affinity exists to keep.
+    //
+    // What must not happen is an account that is at cap ABSORBING additional sessions.
+    // That is enforced where new bindings are chosen (the fill-first branch below and
+    // bindSession's cap accounting), not here.
+    if (!connection && sessionBindingEnabled && sessionId && boundConnection) {
+      connection = boundConnection;
+      log.debug("AUTH", `${provider} | session affinity honoured in mode=${strategy} → ${boundConnection.id.slice(0, 8)}`);
     }
 
     if (!connection && strategy === "quota-weighted") {
@@ -330,10 +409,15 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       // sits idle. Each account then burns through its upstream rate limit and starts
       // returning 429 while hundreds of healthy accounts are never touched.
       //
-      // Instead, order by (priority ASC, load ASC) and take the head. An account with
-      // no sessions always outranks one that already holds sessions, so the pool fills
-      // up in parallel and only the earlier accounts saturate the cap. Accounts that
-      // were excluded or model-locked are already absent from `candidates`.
+      // Instead, order by (load ASC, priority ASC) and take the head. Load must come
+      // FIRST, not priority: ordering by priority ahead of load would again funnel
+      // everything into the single highest-priority account whenever an operator has
+      // actually set per-account priorities, which is the same starvation this branch
+      // exists to prevent. Priority is the tiebreak, so an operator's ordering still
+      // decides between accounts that are equally idle. An account with no sessions
+      // therefore always outranks one that already holds sessions, and the pool fills
+      // up in parallel. Accounts that were excluded or model-locked are already absent
+      // from `candidates`.
       //
       // `load` is the bound-session count when affinity is active, otherwise the
       // in-flight request count, so the same spreading applies with affinity off.
@@ -341,34 +425,40 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       const loadOf = (c) => (useSessionLoad ? getSessionCount(c.id) : getLoad(c.id));
 
       const ranked = [...candidates].sort((a, b) => {
-        const pDiff = (Number(a.priority) || 0) - (Number(b.priority) || 0);
-        if (pDiff !== 0) return pDiff;
         const lDiff = loadOf(a) - loadOf(b);
         if (lDiff !== 0) return lDiff;
+        const pDiff = (Number(a.priority) || 0) - (Number(b.priority) || 0);
+        if (pDiff !== 0) return pDiff;
         // Deterministic tiebreak so equal accounts do not thrash between requests.
         return String(a.id).localeCompare(String(b.id));
       });
 
-      if (useSessionLoad) {
-        const underCap = ranked.find((c) => getSessionCount(c.id) < maxSessions);
-        if (underCap) {
-          connection = underCap;
-          // The session's bound account is preferred (it is moved to the front
-          // earlier), so landing elsewhere means the binding was skipped.
-          if (boundConnection && underCap.id !== boundConnection.id) {
-            log.info("AUTH", `${provider} | session ${String(sessionId).slice(0, 8)} bound ${boundConnection.id.slice(0, 8)} at session cap → using ${underCap.id.slice(0, 8)}`);
-          }
-        } else if (overflowPolicy === "hard") {
-          connection = null;
-        } else {
-          // soft: allow overflow onto the least-loaded account, but warn.
-          connection = ranked[0];
-          if (connection) {
-            log.warn("AUTH", `${provider} | all ${candidates.length} accounts at session cap ${maxSessions} (soft overflow) → ${connection.id?.slice(0, 8)} now holds ${getSessionCount(connection.id) + 1}`);
-          }
-        }
+      // Take the least-loaded account. The candidate list was already reordered so
+      // under-cap accounts come first, so this naturally avoids an account that is at
+      // its session cap while the pool still has room; the overflow policy below only
+      // fires once every candidate is genuinely full.
+      connection = ranked[0];
+    }
+
+    // ---- Overflow policy: every candidate is at its session cap ----
+    // The candidate ordering above guarantees a cap-full account is only reached once
+    // no under-cap account remains, so this is the genuine "pool is full" case: soft
+    // deliberately exceeds on the least-loaded account, hard refuses.
+    if (
+      connection &&
+      !boundConnection &&
+      sessionBindingEnabled &&
+      sessionId &&
+      maxSessions > 0 &&
+      getSessionCount(connection.id) >= maxSessions
+    ) {
+      if (overflowPolicy === "hard") {
+        connection = null;
       } else {
-        connection = ranked[0];
+        log.warn(
+          "AUTH",
+          `${provider} | all ${candidates.length} accounts at session cap ${maxSessions} (soft overflow) → ${connection.id.slice(0, 8)} now holds ${getSessionCount(connection.id) + 1}`
+        );
       }
     }
 
@@ -437,8 +527,10 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     // Only meaningful for quota-weighted scoring — the discount is read exclusively
     // by withOptimisticDiscount(), so recording it in other modes would just grow
     // an unused map.
+    let discountApplied = false;
     if (strategy === "quota-weighted" && connection.id && connection.id !== "noauth") {
       recordConsumption(connection.id, 1);
+      discountApplied = true;
     }
 
     // ---- Record / refresh the session binding ----
@@ -451,7 +543,20 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       }
     }
 
-    const resolvedProxy = await resolveConnectionProxyConfig(connection.providerSpecificData || {});
+    // Anything that can throw AFTER a slot was reserved must release it, otherwise
+    // the credentials object never reaches the caller and its finally-block can never
+    // call releaseAccountSlot() — the count would leak permanently and the account
+    // would look saturated forever, cascading into bogus CONCURRENCY_LIMITED errors.
+    // The optimistic discount is rolled back for the same reason: no request was
+    // ever issued, so nothing was consumed.
+    let resolvedProxy;
+    try {
+      resolvedProxy = await resolveConnectionProxyConfig(connection.providerSpecificData || {});
+    } catch (err) {
+      if (slotAcquired) releaseAccountSlotInternal(connection.id);
+      if (discountApplied) releaseConsumption(connection.id, 1);
+      throw err;
+    }
 
     return {
       authType: connection.authType,
@@ -480,6 +585,10 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       // True when this selection reserved an in-flight concurrency slot that the
       // caller MUST release (in a finally block) via releaseAccountSlot().
       slotReserved: slotAcquired,
+      // True when a short-lived optimistic quota discount was applied for this
+      // selection. Callers that abandon the attempt without consuming quota should
+      // refund it via refundAccountQuotaDiscount().
+      quotaDiscountApplied: discountApplied,
       // Pass full connection for clearAccountError to read modelLock_* keys
       _connection: connection
     };
@@ -500,6 +609,24 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
  */
 export async function markAccountUnavailable(connectionId, status, errorText, provider = null, model = null, resetsAtMs = null) {
   if (!connectionId || connectionId === "noauth") return { shouldFallback: false, cooldownMs: 0 };
+
+  // A 429 caused by per-account CONCURRENCY limits must be short-circuited before
+  // anything else. It is a contention signal, not quota exhaustion: the account is
+  // still perfectly usable once an in-flight request drains.
+  //
+  // This check must come before the githubResetAtMs / resetsAtMs branches, not after.
+  // Providers commonly attach `Retry-After` to concurrency rejections too, which
+  // makes `resetsAtMs` truthy — so a check placed in the trailing `else` would
+  // never be reached for exactly the traffic it was written for, and the account
+  // would be locked for the full retry window.
+  //
+  // Returning early also guarantees we perform NO DB write here, which keeps this
+  // function side-effect free on the concurrency path (callers may probe it before
+  // deciding whether to retry).
+  if (isConcurrencyLimited(status, errorText)) {
+    return { shouldFallback: false, cooldownMs: 0, concurrencyLimited: true };
+  }
+
   const connections = await getProviderConnections({ provider });
   const conn = connections.find(c => c.id === connectionId);
   const backoffLevel = conn?.backoffLevel || 0;
@@ -521,11 +648,7 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
       : Math.min(resetsAtMs - Date.now(), MAX_RATE_LIMIT_COOLDOWN_MS);
     newBackoffLevel = 0;
   } else {
-    const verdict = checkFallbackError(status, errorText, backoffLevel);
-    ({ shouldFallback, cooldownMs, newBackoffLevel } = verdict);
-    // A 429 classified as concurrency contention must NOT lock the account; the
-    // caller retries the same account after a short delay instead.
-    if (verdict.concurrencyLimited) return { shouldFallback: false, cooldownMs: 0, concurrencyLimited: true };
+    ({ shouldFallback, cooldownMs, newBackoffLevel } = checkFallbackError(status, errorText, backoffLevel));
   }
   if (!shouldFallback) return { shouldFallback: false, cooldownMs: 0 };
 
@@ -614,6 +737,31 @@ export function releaseAccountSlot(credentials) {
   if (!connectionId || connectionId === "noauth") return;
   releaseAccountSlotInternal(connectionId);
   credentials.slotReserved = false;
+}
+
+/**
+ * Refund the optimistic quota discount applied when these credentials were
+ * selected.
+ *
+ * Call this when the attempt is abandoned WITHOUT consuming upstream quota — a
+ * concurrency-429 retry or a failover to a different account. Leaving the
+ * discount in place would make a healthy account look emptier than it is for the
+ * rest of the 30s decay window and steer later selections away from it.
+ *
+ * Do NOT call it after a request that actually reached the provider: that one did
+ * consume quota, and the discount is exactly the signal we want to keep.
+ *
+ * Safe to call unconditionally — it is a no-op when no discount was applied, and
+ * the flag is cleared so a double call cannot over-refund.
+ *
+ * @param {object|null} credentials - the object returned by getProviderCredentials
+ */
+export function refundAccountQuotaDiscount(credentials) {
+  if (!credentials || !credentials.quotaDiscountApplied) return;
+  const connectionId = credentials.connectionId || credentials.id;
+  if (!connectionId || connectionId === "noauth") return;
+  releaseConsumption(connectionId, 1);
+  credentials.quotaDiscountApplied = false;
 }
 
 /**

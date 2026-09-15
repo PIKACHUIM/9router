@@ -1757,7 +1757,7 @@ export default function ProfilePage() {
 
             <p className="text-xs text-text-muted italic pt-2 border-t border-border/50">
               {settings.sessionBindingEnabled !== false
-                ? `Sessions stay on one account (max ${settings.maxSessionsPerAccount ?? 3 || "∞"} per account, ${settings.sessionOverflowPolicy || "soft"} overflow).`
+                ? `Sessions stay on one account (max ${settings.maxSessionsPerAccount ?? "∞"} per account, ${settings.sessionOverflowPolicy || "soft"} overflow).`
                 : "Session affinity is off — accounts are chosen purely by the scheduling mode above."}
               {(settings.schedulingMode === "quota-weighted")
                 ? " Quota-weighted scoring prefers accounts with more remaining quota and, when enabled, sooner expiry."
