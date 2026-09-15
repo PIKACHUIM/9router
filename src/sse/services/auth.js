@@ -273,28 +273,35 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     // prefers them, and a cap-full account only gets selected when nothing else is
     // left — which is exactly when the soft/hard overflow policy should apply. The
     // bound account is exempt because reusing it cannot grow its session count.
-    if (sessionBindingEnabled && sessionId && !boundConnectionId && maxSessions > 0) {
+    if (sessionBindingEnabled && sessionId && !boundConnection && maxSessions > 0) {
       const underCap = [];
       const atCap = [];
       for (const c of candidates) {
         if (getSessionCount(c.id) < maxSessions) underCap.push(c);
         else atCap.push(c);
       }
-      // Preserve the mode-visible order within each group (priority order from the
-      // repo), and put the least-loaded under-cap accounts first so the pool spreads.
+      // Least-loaded first WITHIN each group is what spreads the pool, but priority
+      // must still win so an operator's ordering is respected:
+      //   under-cap: priority ASC, then load ASC, then id (stable, deterministic)
+      //   at-cap:    load ASC (this feeds the soft-overflow pick), then priority ASC
+      const byPriority = (a, b) =>
+        (Number(a.priority) || 0) - (Number(b.priority) || 0) ||
+        String(a.id).localeCompare(String(b.id));
       underCap.sort(
-        (a, b) => getSessionCount(a.id) - getSessionCount(b.id) || 0
+        (a, b) => getSessionCount(a.id) - getSessionCount(b.id) || byPriority(a, b)
       );
-      atCap.sort((a, b) => getSessionCount(a.id) - getSessionCount(b.id) || 0);
+      atCap.sort(
+        (a, b) => getSessionCount(a.id) - getSessionCount(b.id) || byPriority(a, b)
+      );
       if (atCap.length) {
         log.debug(
           "AUTH",
-          `${provider} | new session ${String(sessionId).slice(0, 8)}: ${underCap.length} account(s) under cap, ${atCap.length} at cap → under-cap first`
+          `${provider} | new session ${String(sessionId).slice(0, 8)}: ${underCap.length} account(s) under cap, ${atCap.length} at cap (pool full) → under-cap first`
         );
       }
+      // Under-cap accounts always come first so the whole pool is consumed before the
+      // cap is exceeded; the overflow policy below only fires if `underCap` is empty.
       candidates = [...underCap, ...atCap];
-      // The bound account (if any) keeps its priority position at the head.
-      if (boundConnection) candidates = [boundConnection, ...candidates.filter((c) => c.id !== boundConnection.id)];
     }
 
     let connection;
@@ -402,10 +409,15 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       // sits idle. Each account then burns through its upstream rate limit and starts
       // returning 429 while hundreds of healthy accounts are never touched.
       //
-      // Instead, order by (priority ASC, load ASC) and take the head. An account with
-      // no sessions always outranks one that already holds sessions, so the pool fills
-      // up in parallel and only the earlier accounts saturate the cap. Accounts that
-      // were excluded or model-locked are already absent from `candidates`.
+      // Instead, order by (load ASC, priority ASC) and take the head. Load must come
+      // FIRST, not priority: ordering by priority ahead of load would again funnel
+      // everything into the single highest-priority account whenever an operator has
+      // actually set per-account priorities, which is the same starvation this branch
+      // exists to prevent. Priority is the tiebreak, so an operator's ordering still
+      // decides between accounts that are equally idle. An account with no sessions
+      // therefore always outranks one that already holds sessions, and the pool fills
+      // up in parallel. Accounts that were excluded or model-locked are already absent
+      // from `candidates`.
       //
       // `load` is the bound-session count when affinity is active, otherwise the
       // in-flight request count, so the same spreading applies with affinity off.
@@ -413,10 +425,10 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       const loadOf = (c) => (useSessionLoad ? getSessionCount(c.id) : getLoad(c.id));
 
       const ranked = [...candidates].sort((a, b) => {
-        const pDiff = (Number(a.priority) || 0) - (Number(b.priority) || 0);
-        if (pDiff !== 0) return pDiff;
         const lDiff = loadOf(a) - loadOf(b);
         if (lDiff !== 0) return lDiff;
+        const pDiff = (Number(a.priority) || 0) - (Number(b.priority) || 0);
+        if (pDiff !== 0) return pDiff;
         // Deterministic tiebreak so equal accounts do not thrash between requests.
         return String(a.id).localeCompare(String(b.id));
       });
