@@ -261,6 +261,42 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       }
     }
 
+    // ---- New-session capacity shaping (all scheduling modes) ----
+    // A session without a binding must consume the WHOLE enabled pool before any
+    // account is pushed past maxSessionsPerAccount: the cap is a limit on how many
+    // distinct conversations an account absorbs, so an account already at its cap
+    // must not be chosen while accounts below it still have room.
+    //
+    // Rather than intercepting each mode's pick afterwards (which would also strand
+    // round-robin's lastUsedAt write on the wrong account), the full candidates are
+    // reordered so under-cap accounts come first. Every mode downstream then naturally
+    // prefers them, and a cap-full account only gets selected when nothing else is
+    // left — which is exactly when the soft/hard overflow policy should apply. The
+    // bound account is exempt because reusing it cannot grow its session count.
+    if (sessionBindingEnabled && sessionId && !boundConnectionId && maxSessions > 0) {
+      const underCap = [];
+      const atCap = [];
+      for (const c of candidates) {
+        if (getSessionCount(c.id) < maxSessions) underCap.push(c);
+        else atCap.push(c);
+      }
+      // Preserve the mode-visible order within each group (priority order from the
+      // repo), and put the least-loaded under-cap accounts first so the pool spreads.
+      underCap.sort(
+        (a, b) => getSessionCount(a.id) - getSessionCount(b.id) || 0
+      );
+      atCap.sort((a, b) => getSessionCount(a.id) - getSessionCount(b.id) || 0);
+      if (atCap.length) {
+        log.debug(
+          "AUTH",
+          `${provider} | new session ${String(sessionId).slice(0, 8)}: ${underCap.length} account(s) under cap, ${atCap.length} at cap → under-cap first`
+        );
+      }
+      candidates = [...underCap, ...atCap];
+      // The bound account (if any) keeps its priority position at the head.
+      if (boundConnection) candidates = [boundConnection, ...candidates.filter((c) => c.id !== boundConnection.id)];
+    }
+
     let connection;
     // Pin to preferred connection if specified and available.
     // Precedence (audit item #10): an explicit hard pin (preferredConnectionId) is a
@@ -279,24 +315,22 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     // enough for fill-first but is silently discarded by round-robin (sorts by
     // lastUsedAt) and quota-weighted (sorts by score). Since the UI lets affinity be
     // combined with any mode, honour it here: if the session already has a healthy
-    // bound account with capacity, reuse it regardless of mode. That is the entire
-    // point of affinity — keeping the upstream prompt cache warm.
+    // bound account, reuse it regardless of mode. That is the entire point of
+    // affinity — keeping the upstream prompt cache warm.
     //
     // The concurrency gate below can still fail over to another candidate if this
     // account turns out to be saturated, so this is a preference, not a pin.
+    //
+    // Session-cap interaction: reusing the bound account does NOT grow its session
+    // count (getBoundConnection() only returns an account that already holds this
+    // session), so a bound account at its cap should NOT be treated as full for THIS
+    // session — evicting it here would rebind an established conversation to a cold
+    // account on every request, destroying the prompt cache affinity exists to keep.
+    //
+    // What must not happen is an account that is at cap ABSORBING additional sessions.
+    // That is enforced where new bindings are chosen (the fill-first branch below and
+    // bindSession's cap accounting), not here.
     if (!connection && sessionBindingEnabled && sessionId && boundConnection) {
-      // No session-cap check here, deliberately. `boundConnection` is non-null only
-      // when getBoundConnection() resolved THIS session to it, so the session is
-      // already counted by getSessionCount() — reusing it cannot grow the account's
-      // session total, and the cap exists to limit how many sessions an account
-      // ABSORBS, not to evict ones it already holds.
-      //
-      // Evicting here would also be counter-productive: it would rebind an
-      // established conversation to a cold account (losing the upstream prompt
-      // cache) every single request once the account sat at its cap.
-      //
-      // Capacity is still enforced where it matters: the concurrency gate below can
-      // reject this account and walk to another candidate.
       connection = boundConnection;
       log.debug("AUTH", `${provider} | session affinity honoured in mode=${strategy} → ${boundConnection.id.slice(0, 8)}`);
     }
@@ -387,26 +421,32 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
         return String(a.id).localeCompare(String(b.id));
       });
 
-      if (useSessionLoad) {
-        const underCap = ranked.find((c) => getSessionCount(c.id) < maxSessions);
-        if (underCap) {
-          connection = underCap;
-          // The session's bound account is preferred (it is moved to the front
-          // earlier), so landing elsewhere means the binding was skipped.
-          if (boundConnection && underCap.id !== boundConnection.id) {
-            log.info("AUTH", `${provider} | session ${String(sessionId).slice(0, 8)} bound ${boundConnection.id.slice(0, 8)} at session cap → using ${underCap.id.slice(0, 8)}`);
-          }
-        } else if (overflowPolicy === "hard") {
-          connection = null;
-        } else {
-          // soft: allow overflow onto the least-loaded account, but warn.
-          connection = ranked[0];
-          if (connection) {
-            log.warn("AUTH", `${provider} | all ${candidates.length} accounts at session cap ${maxSessions} (soft overflow) → ${connection.id?.slice(0, 8)} now holds ${getSessionCount(connection.id) + 1}`);
-          }
-        }
+      // Take the least-loaded account. The candidate list was already reordered so
+      // under-cap accounts come first, so this naturally avoids an account that is at
+      // its session cap while the pool still has room; the overflow policy below only
+      // fires once every candidate is genuinely full.
+      connection = ranked[0];
+    }
+
+    // ---- Overflow policy: every candidate is at its session cap ----
+    // The candidate ordering above guarantees a cap-full account is only reached once
+    // no under-cap account remains, so this is the genuine "pool is full" case: soft
+    // deliberately exceeds on the least-loaded account, hard refuses.
+    if (
+      connection &&
+      !boundConnection &&
+      sessionBindingEnabled &&
+      sessionId &&
+      maxSessions > 0 &&
+      getSessionCount(connection.id) >= maxSessions
+    ) {
+      if (overflowPolicy === "hard") {
+        connection = null;
       } else {
-        connection = ranked[0];
+        log.warn(
+          "AUTH",
+          `${provider} | all ${candidates.length} accounts at session cap ${maxSessions} (soft overflow) → ${connection.id.slice(0, 8)} now holds ${getSessionCount(connection.id) + 1}`
+        );
       }
     }
 
