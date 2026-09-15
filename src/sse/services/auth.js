@@ -285,11 +285,20 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     // The concurrency gate below can still fail over to another candidate if this
     // account turns out to be saturated, so this is a preference, not a pin.
     if (!connection && sessionBindingEnabled && sessionId && boundConnection) {
-      const atSessionCap = maxSessions > 0 && getSessionCount(boundConnection.id) > maxSessions;
-      if (!atSessionCap) {
-        connection = boundConnection;
-        log.debug("AUTH", `${provider} | session affinity honoured in mode=${strategy} → ${boundConnection.id.slice(0, 8)}`);
-      }
+      // No session-cap check here, deliberately. `boundConnection` is non-null only
+      // when getBoundConnection() resolved THIS session to it, so the session is
+      // already counted by getSessionCount() — reusing it cannot grow the account's
+      // session total, and the cap exists to limit how many sessions an account
+      // ABSORBS, not to evict ones it already holds.
+      //
+      // Evicting here would also be counter-productive: it would rebind an
+      // established conversation to a cold account (losing the upstream prompt
+      // cache) every single request once the account sat at its cap.
+      //
+      // Capacity is still enforced where it matters: the concurrency gate below can
+      // reject this account and walk to another candidate.
+      connection = boundConnection;
+      log.debug("AUTH", `${provider} | session affinity honoured in mode=${strategy} → ${boundConnection.id.slice(0, 8)}`);
     }
 
     if (!connection && strategy === "quota-weighted") {
