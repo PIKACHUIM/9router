@@ -4,7 +4,7 @@ import { formatRetryAfter, checkFallbackError, isConcurrencyLimited, isModelLock
 import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
 import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
 import { getAntigravityQuotaCache } from "./antigravityQuota.js";
-import { acquire as acquireAccountSlot, release as releaseAccountSlotInternal, DEFAULT_MAX_CONCURRENT_PER_ACCOUNT } from "open-sse/services/accountLoad.js";
+import { acquire as acquireAccountSlot, release as releaseAccountSlotInternal, getLoad, DEFAULT_MAX_CONCURRENT_PER_ACCOUNT } from "open-sse/services/accountLoad.js";
 import { getBoundConnection, bindSession, getSessionCount, startSessionBindingSweeper } from "open-sse/services/sessionBindings.js";
 import { pickQuotaWeighted, withOptimisticDiscount, recordConsumption, releaseConsumption } from "open-sse/services/quotaScheduler.js";
 import * as log from "../utils/logger.js";
@@ -360,16 +360,39 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
         });
       }
     } else {
-      // Default: fill-first (already sorted by priority in getProviderConnections).
-      // Respect the per-account session cap so one account does not absorb every
-      // session; fall through to the next candidate when it is at capacity.
-      if (sessionBindingEnabled && sessionId && maxSessions > 0) {
-        const underCap = candidates.find((c) => getSessionCount(c.id) < maxSessions);
+      // Default: fill-first.
+      //
+      // Fill-first must not mean "always take candidates[0]". When many accounts
+      // share the same priority (the common case — every row left at its default),
+      // that collapses all traffic onto the first account while the rest of the pool
+      // sits idle. Each account then burns through its upstream rate limit and starts
+      // returning 429 while hundreds of healthy accounts are never touched.
+      //
+      // Instead, order by (priority ASC, load ASC) and take the head. An account with
+      // no sessions always outranks one that already holds sessions, so the pool fills
+      // up in parallel and only the earlier accounts saturate the cap. Accounts that
+      // were excluded or model-locked are already absent from `candidates`.
+      //
+      // `load` is the bound-session count when affinity is active, otherwise the
+      // in-flight request count, so the same spreading applies with affinity off.
+      const useSessionLoad = sessionBindingEnabled && sessionId && maxSessions > 0;
+      const loadOf = (c) => (useSessionLoad ? getSessionCount(c.id) : getLoad(c.id));
+
+      const ranked = [...candidates].sort((a, b) => {
+        const pDiff = (Number(a.priority) || 0) - (Number(b.priority) || 0);
+        if (pDiff !== 0) return pDiff;
+        const lDiff = loadOf(a) - loadOf(b);
+        if (lDiff !== 0) return lDiff;
+        // Deterministic tiebreak so equal accounts do not thrash between requests.
+        return String(a.id).localeCompare(String(b.id));
+      });
+
+      if (useSessionLoad) {
+        const underCap = ranked.find((c) => getSessionCount(c.id) < maxSessions);
         if (underCap) {
           connection = underCap;
-          // The session's bound account is first in `candidates`, so ending up on a
-          // different one means the binding was skipped (it is either at its session
-          // cap, or the concurrency gate will reject it). Rebinding is handled below.
+          // The session's bound account is preferred (it is moved to the front
+          // earlier), so landing elsewhere means the binding was skipped.
           if (boundConnection && underCap.id !== boundConnection.id) {
             log.info("AUTH", `${provider} | session ${String(sessionId).slice(0, 8)} bound ${boundConnection.id.slice(0, 8)} at session cap → using ${underCap.id.slice(0, 8)}`);
           }
@@ -377,14 +400,13 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
           connection = null;
         } else {
           // soft: allow overflow onto the least-loaded account, but warn.
-          const leastLoaded = [...candidates].sort((a, b) => getSessionCount(a.id) - getSessionCount(b.id))[0];
-          connection = leastLoaded || candidates[0];
+          connection = ranked[0];
           if (connection) {
             log.warn("AUTH", `${provider} | all ${candidates.length} accounts at session cap ${maxSessions} (soft overflow) → ${connection.id?.slice(0, 8)} now holds ${getSessionCount(connection.id) + 1}`);
           }
         }
       } else {
-        connection = candidates[0];
+        connection = ranked[0];
       }
     }
 
