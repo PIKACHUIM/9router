@@ -116,6 +116,43 @@ export const CONCURRENCY_RETRY_JITTER_MS = 600;
 export const CONCURRENCY_RETRY_MAX = 3;
 
 /**
+ * Request-scoped error patterns: the failing thing is the REQUEST (or the
+ * provider outright rejecting the model), not the account. Retrying another
+ * account replays the exact same request and gets the exact same rejection, so
+ * these must NOT lock the account or bump its backoff — see isRequestScopedError().
+ *
+ * Deliberately does NOT include quota texts ("capacity", "overloaded",
+ * "rate limit", ...) even though they also mean "this account is done": those
+ * are ACCOUNT-scoped and must keep their exponential-backoff lock.
+ */
+export const REQUEST_SCOPED_PATTERNS = [
+  // --- Context window / prompt size (e.g. codebuddy 11115: "prompt is too long:
+  // 1436966 tokens > 1048576 maximum") ---
+  "context_length_exceeded",
+  "context length exceeded",
+  "maximum context length",
+  "context window",
+  "prompt is too long",
+  "prompt too long",
+  "input is too long",
+  "input too long",
+  "too many tokens",
+  "token limit exceeded",
+  "exceeds the maximum number of tokens",
+  "exceeds the model context limit",
+  "reduce the length of the messages",
+  "maximum number of tokens",
+  // --- Model outright rejected for this connection: failover cannot fix it ---
+  "model_not_found",
+  "model not found",
+  "model not supported",
+  "model_not_supported",
+  "model not available",
+  "service info not found",
+  "model service not found",
+];
+
+/**
  * Unified error classification rules.
  * Checked top-to-bottom: text rules first (by order), then status rules.
  * Each rule: { text?, status?, cooldownMs?, backoff? }

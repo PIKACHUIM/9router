@@ -1,6 +1,6 @@
 import { getProviderConnections, validateApiKey, updateProviderConnection, getSettings, getProxyPools } from "@/lib/localDb";
 import { resolveConnectionProxyConfig, pickProxyPoolId } from "@/lib/network/connectionProxy";
-import { formatRetryAfter, checkFallbackError, isConcurrencyLimited, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
+import { formatRetryAfter, checkFallbackError, isConcurrencyLimited, isRequestScopedError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
 import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
 import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
 import { getAntigravityQuotaCache } from "./antigravityQuota.js";
@@ -625,6 +625,16 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
   // deciding whether to retry).
   if (isConcurrencyLimited(status, errorText)) {
     return { shouldFallback: false, cooldownMs: 0, concurrencyLimited: true };
+  }
+
+  // Request-scoped errors (context window exceeded, malformed payload, model
+  // unsupported for this connection) fail identically on EVERY account. Locking
+  // the account here would walk the whole pool — one oversized request would mark
+  // every account unavailable and the client would then see a bogus
+  // "all accounts locked (reset after Ns)". Short-circuit with NO DB write and let
+  // the upstream error surface verbatim (400).
+  if (isRequestScopedError(status, errorText)) {
+    return { shouldFallback: false, cooldownMs: 0 };
   }
 
   const connections = await getProviderConnections({ provider });
