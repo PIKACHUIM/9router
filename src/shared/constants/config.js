@@ -92,6 +92,19 @@ export const QUOTA_AUTOPING_CONFIG = {
   },
 };
 
+// Daily check-in: auto sign-in for supported providers (currently CodeBuddy CN).
+export const CHECKIN_CONFIG = {
+  tickIntervalMs: 30 * 60 * 1000,       // scheduler tick (30min) — cheap: only hits API when not yet checked in
+  checkWindowStartHour: 0,              // local hour after which check-in should happen
+  failureCooldownMs: 60 * 60 * 1000,    // retry cooldown after a failed check-in
+  concurrency: 3,                       // parallel accounts per run
+  providers: {
+    "codebuddy-cn": {
+      settingsKey: "codebuddyCheckin",  // settings[settingsKey].connections[connId] === true
+    },
+  },
+};
+
 // Re-export from providers.js for backward compatibility
 export {
   FREE_PROVIDERS,

@@ -3,6 +3,7 @@ import "open-sse/index.js";
 
 import { getProviderConnectionById, updateProviderConnection } from "@/lib/localDb";
 import { getUsageForProvider } from "open-sse/services/usage.js";
+import { setUsageSnapshot } from "open-sse/services/usageSnapshot.js";
 import { getExecutor } from "open-sse/executors/index.js";
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
 import { USAGE_APIKEY_PROVIDERS } from "@/shared/constants/providers";
@@ -181,6 +182,15 @@ export async function GET(request, { params }) {
       } catch (retryError) {
         console.warn(`[Usage] ${connection.provider}: force refresh failed: ${retryError.message}`);
       }
+    }
+
+    // Publish the finished allowance list for the quota-weighted scheduler. This is the
+    // only place the app already pays for these upstream usage calls (the dashboard and
+    // the auto-ping tick both come through here), so the scheduler consumes the result
+    // instead of running a second poller with its own rate-limit budget.
+    // See open-sse/services/usageSnapshot.js.
+    if (usage?.quotas) {
+      setUsageSnapshot(connection.id, connection.provider, usage.quotas);
     }
 
     return Response.json(usage);

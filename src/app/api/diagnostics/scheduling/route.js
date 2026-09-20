@@ -30,6 +30,7 @@ export async function GET() {
         quotaPreferEarlierExpiry: settings.quotaPreferEarlierExpiry,
         quotaWeightRemaining: settings.quotaWeightRemaining,
         quotaWeightExpiry: settings.quotaWeightExpiry,
+        quotaFairShareWeight: settings.quotaFairShareWeight,
         sessionProbeEnabled: settings.sessionProbeEnabled,
       },
       sessionProbe: snapshotSessionProbe(),

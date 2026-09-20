@@ -9,6 +9,7 @@ import { CLAUDE_CLI_SPOOF_HEADERS } from "open-sse/providers/shared.js";
 import { proxyAwareFetch } from "open-sse/utils/proxyFetch.js";
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
 import { refreshAndUpdateCredentials } from "@/app/api/usage/[connectionId]/route.js";
+import { setUsageSnapshot } from "open-sse/services/usageSnapshot.js";
 import { QUOTA_AUTOPING_CONFIG } from "@/shared/constants/config";
 
 const C = QUOTA_AUTOPING_CONFIG;
@@ -210,6 +211,10 @@ async function pingConnection(conn, provider, providerConfig, handler, deps, sta
 
   const usage = await handler.getUsage(connection.accessToken, proxyOptions);
   const quotas = usage?.quotas || {};
+  // Feed the scheduler's allowance cache: this tick already paid for the usage call, so
+  // the quota-weighted scorer gets the account's live packages for free
+  // (see open-sse/services/usageSnapshot.js).
+  setUsageSnapshot(connection.id, connection.provider, quotas);
   const quota = quotas?.[providerConfig.quotaKey];
   const resetAt = quota?.resetAt;
   if (!resetAt) return;

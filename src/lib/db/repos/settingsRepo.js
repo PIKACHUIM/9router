@@ -102,12 +102,23 @@ const DEFAULT_SETTINGS = {
   // Weight of remaining-quota vs time-to-expiry in the quota-weighted score.
   quotaWeightRemaining: 1.0,
   quotaWeightExpiry: 0.5,
+  // Weight of the per-account WEIGHTED FAIR SHARE term, which spreads traffic across
+  // accounts in proportion to how much of each account's quota is about to expire.
+  // Without it the scorer has a single winner, so one account gets drained to zero
+  // while every other account's packages age out unused. Set to 0 to fall back to
+  // pure score ordering (first-come, most-at-risk-first).
+  quotaFairShareWeight: 1.0,
   // Exponential-backoff lock still applies to genuine (quota) 429s.
   // Concurrency-429 never locks an account.
 
   // ---- Diagnostics ----
   // Read-only session identity probe (no behaviour change). Also via env SESSION_PROBE=1.
   sessionProbeEnabled: false,
+
+  // ---- Daily check-in (auto sign-in) ----
+  // Per-account opt-in map: { connections: { [connectionId]: true } }.
+  // The scheduler signs in each enabled account once per day.
+  codebuddyCheckin: { connections: {} },
 };
 
 async function readRaw() {

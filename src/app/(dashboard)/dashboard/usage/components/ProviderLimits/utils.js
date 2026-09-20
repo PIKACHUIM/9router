@@ -311,6 +311,59 @@ export function getRemainingPercentage(quota) {
   return calculatePercentage(quota?.used, quota?.total);
 }
 
+/**
+ * Sum a parsed quota list into the "Total / Used / Available" points summary.
+ *
+ * Per the product decision an account's total points are the SUM over every package it
+ * holds — a CodeBuddy account with a refill pack plus three bonus packs reports all four
+ * added up, not just the first row.
+ *
+ * @param {Array<Object>} quotas - Parsed quota rows (as produced by parseQuotaData).
+ * @returns {{total:number, used:number, available:number, packages:number, hasData:boolean}}
+ */
+export function sumQuotaPoints(quotas) {
+  const summary = { total: 0, used: 0, available: 0, packages: 0, hasData: false };
+
+  for (const quota of quotas || []) {
+    if (!quota || quota.unlimited === true) continue;
+
+    const total = Number(quota.total);
+    const used = Number(quota.used);
+
+    if (Number.isFinite(total) && total > 0 && Number.isFinite(used)) {
+      summary.total += total;
+      summary.used += Math.max(0, used);
+      summary.available += Math.max(0, total - used);
+      summary.packages += 1;
+      summary.hasData = true;
+      continue;
+    }
+
+    // Rows that publish only a remaining percentage (no usable total/used pair) still
+    // describe a real allowance, so fold them in on the shared 0-100 scale rather than
+    // silently dropping them from the total.
+    const hasPercentage =
+      quota.remaining !== undefined || quota.remainingPercentage !== undefined;
+    if (!hasPercentage) continue;
+
+    const remainingPct = Math.min(100, Math.max(0, getRemainingPercentage(quota)));
+    summary.total += 100;
+    summary.used += 100 - remainingPct;
+    summary.available += remainingPct;
+    summary.packages += 1;
+    summary.hasData = true;
+  }
+
+  return summary;
+}
+
+/** Compact display for a points total (keeps fractional balances readable). */
+export function formatPoints(value) {
+  if (!Number.isFinite(value)) return "–";
+  const rounded = Math.round(value * 100) / 100;
+  return rounded.toLocaleString(undefined, { maximumFractionDigits: 2 });
+}
+
 export function getQuotaVisibilityKey(quota) {
   if (!quota || typeof quota !== "object") return "";
   return String(quota.modelKey || quota.name || "").trim();

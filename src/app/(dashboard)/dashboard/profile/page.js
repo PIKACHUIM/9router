@@ -1594,7 +1594,8 @@ export default function ProfilePage() {
                   <div className="flex-1 min-w-0">
                     <p className="font-medium text-sm sm:text-base">Prefer Earlier Expiry</p>
                     <p className="text-xs sm:text-sm text-text-muted">
-                      Burn soon-to-expire balances before they are wasted
+                      Favour accounts whose own allowance needs burning fastest, so a package
+                      expiring soon is used before an equivalent balance that expires later
                     </p>
                   </div>
                   <Toggle
@@ -1631,6 +1632,27 @@ export default function ProfilePage() {
                     step="0.1"
                     value={settings.quotaWeightExpiry ?? 0.5}
                     onChange={(e) => updateNumberSetting("quotaWeightExpiry", e.target.value, { min: 0, max: 10 })}
+                    disabled={loading}
+                    className="w-20 text-center shrink-0"
+                  />
+                </div>
+                <div className="flex items-start sm:items-center justify-between gap-4 pt-2 border-t border-border/50">
+                  <div className="flex-1 min-w-0">
+                    <p className="font-medium text-sm sm:text-base">Fair Share Weight</p>
+                    <p className="text-xs sm:text-sm text-text-muted">
+                      How strongly traffic is spread across accounts in proportion to the quota
+                      each one is about to lose. Higher values stop a single account being drained
+                      to zero while other accounts&apos; packages expire unused. 0 = pure score
+                      ordering with no spreading.
+                    </p>
+                  </div>
+                  <Input
+                    type="number"
+                    min="0"
+                    max="10"
+                    step="0.1"
+                    value={settings.quotaFairShareWeight ?? 1.0}
+                    onChange={(e) => updateNumberSetting("quotaFairShareWeight", e.target.value, { min: 0, max: 10 })}
                     disabled={loading}
                     className="w-20 text-center shrink-0"
                   />
@@ -1760,7 +1782,7 @@ export default function ProfilePage() {
                 ? `Sessions stay on one account (max ${settings.maxSessionsPerAccount ?? "∞"} per account, ${settings.sessionOverflowPolicy || "soft"} overflow).`
                 : "Session affinity is off — accounts are chosen purely by the scheduling mode above."}
               {(settings.schedulingMode === "quota-weighted")
-                ? " Quota-weighted scoring prefers accounts with more remaining quota and, when enabled, sooner expiry."
+                ? " Quota-weighted scoring burns each account's soonest-expiring package first, spreading traffic across accounts instead of draining one of them."
                 : ""}
             </p>
           </div>

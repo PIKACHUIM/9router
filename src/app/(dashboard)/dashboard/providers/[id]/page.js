@@ -65,6 +65,9 @@ export default function ProviderDetailPage() {
   const [selectedConnectionIds, setSelectedConnectionIds] = useState([]);
   const [bulkProxyPoolId, setBulkProxyPoolId] = useState("__none__");
   const [bulkUpdatingProxy, setBulkUpdatingProxy] = useState(false);
+  // Which bulk enable/disable run is in flight ("enable" | "disable" | null) so the two
+  // buttons can show progress and stay disabled while the loop runs.
+  const [bulkTogglingActive, setBulkTogglingActive] = useState(null);
   const [providerStrategy, setProviderStrategy] = useState(null);
   const [providerStickyLimit, setProviderStickyLimit] = useState("");
   const [thinkingMode, setThinkingMode] = useState("auto");
@@ -803,6 +806,38 @@ export default function ProviderDetailPage() {
     });
   };
 
+  // Enable/disable every selected connection. Applied optimistically so the rows react
+  // immediately, then reconciled from the server (a partial failure must not leave the
+  // list claiming a state the API rejected).
+  const handleBulkSetActive = async (isActive) => {
+    const ids = [...selectedConnectionIds];
+    if (ids.length === 0 || bulkTogglingActive) return;
+
+    setBulkTogglingActive(isActive ? "enable" : "disable");
+    setConnections(prev => prev.map(c => (ids.includes(c.id) ? { ...c, isActive } : c)));
+
+    let failed = 0;
+    for (const id of ids) {
+      try {
+        const res = await fetch(`/api/providers/${id}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ isActive }),
+        });
+        if (!res.ok) failed += 1;
+      } catch (error) {
+        console.log("Error updating connection status:", error);
+        failed += 1;
+      }
+    }
+
+    await fetchConnections();
+    setBulkTogglingActive(null);
+    if (failed > 0) {
+      alert(`${isActive ? "Enabled" : "Disabled"} ${ids.length - failed} connection(s), ${failed} failed.`);
+    }
+  };
+
   const handleOAuthSuccess = () => {
     fetchConnections();
     setShowOAuthModal(false);
@@ -1515,6 +1550,34 @@ export default function ProviderDetailPage() {
                     >
                       Delete Selected ({selectedConnectionIds.length})
                     </Button>
+                  )}
+                  {selectedConnectionIds.length > 0 && (
+                    <>
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        icon="toggle_on"
+                        onClick={() => handleBulkSetActive(true)}
+                        disabled={!!bulkTogglingActive}
+                        loading={bulkTogglingActive === "enable"}
+                      >
+                        {bulkTogglingActive === "enable"
+                          ? "Enabling..."
+                          : `Enable Selected (${selectedConnectionIds.length})`}
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        icon="toggle_off"
+                        onClick={() => handleBulkSetActive(false)}
+                        disabled={!!bulkTogglingActive}
+                        loading={bulkTogglingActive === "disable"}
+                      >
+                        {bulkTogglingActive === "disable"
+                          ? "Disabling..."
+                          : `Disable Selected (${selectedConnectionIds.length})`}
+                      </Button>
+                    </>
                   )}
                   <Button
                     size="sm"

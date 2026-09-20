@@ -456,6 +456,7 @@ export default function SchedulingDiagnosticsPage() {
             ["Prefer earlier expiry", settings.quotaPreferEarlierExpiry ? "on" : "off"],
             ["Quota weight (remaining)", settings.quotaWeightRemaining],
             ["Quota weight (expiry)", settings.quotaWeightExpiry],
+            ["Quota fair share weight", settings.quotaFairShareWeight],
             ["Probe enabled", settings.sessionProbeEnabled ? "on" : "off"],
           ].map(([label, value]) => (
             <div

@@ -7,6 +7,8 @@ import { getAntigravityQuotaCache } from "./antigravityQuota.js";
 import { acquire as acquireAccountSlot, release as releaseAccountSlotInternal, getLoad, DEFAULT_MAX_CONCURRENT_PER_ACCOUNT } from "open-sse/services/accountLoad.js";
 import { getBoundConnection, bindSession, getSessionCount, startSessionBindingSweeper } from "open-sse/services/sessionBindings.js";
 import { pickQuotaWeighted, withOptimisticDiscount, recordConsumption, releaseConsumption } from "open-sse/services/quotaScheduler.js";
+import { packagesFromQuotas, aggregatePackages, normalizeQuota } from "open-sse/services/quotaPackages.js";
+import { getUsageSnapshot } from "open-sse/services/usageSnapshot.js";
 import * as log from "../utils/logger.js";
 
 // Mutex to prevent race conditions during account selection.
@@ -46,26 +48,38 @@ function ensureSessionSweeper(settings) {
 }
 
 /**
- * Resolve a comparable quota descriptor for an account, for quota-weighted
- * scheduling. Sources, in order:
- *   1. Antigravity live quota cache (per-model remaining percentage + resetAt)
- *   2. providerSpecificData.quota snapshot ({"remaining","total","resetAt"})
+ * Resolve a quota descriptor for an account, for quota-weighted scheduling.
+ *
+ * The descriptor is expected to carry a `packages` list — one entry per allowance the
+ * account holds, each with its own balance and deadline — because the scheduler has to
+ * know WHICH allowance is about to be wasted, not just how much is left overall.
+ *
+ * Sources, in order:
+ *   1. Antigravity live quota cache. It already holds every bucket for the account
+ *      (one 5h window per model, plus the weekly pools on free tier), so all of them
+ *      are turned into packages instead of only the requested model's row.
+ *   2. Live usage snapshot published by GET /api/usage/[connectionId] — the same data
+ *      the dashboard already polls, so this costs no extra upstream request.
+ *   3. Static snapshot on the connection: either a `{ packages }` list or the legacy
+ *      single `{ remaining, total, resetAt }` object from set-quota.mjs.
+ *
  * Returns null when nothing is known — the scheduler then scores it neutral.
  */
-function resolveAccountQuota(connection, providerId, model) {
-  if (providerId === "antigravity" && model) {
-    const cache = getAntigravityQuotaCache();
-    const q = cache?.get(connection.id)?.[model];
-    if (q) {
-      const resetAtMs = q.resetAt ? new Date(q.resetAt).getTime() : NaN;
-      return {
-        remaining: Number.isFinite(q.remainingPercentage) ? q.remainingPercentage : NaN,
-        total: 100,
-        resetAtMs,
-      };
-    }
+function resolveAccountQuota(connection, providerId) {
+  if (providerId === "antigravity") {
+    const buckets = getAntigravityQuotaCache()?.get(connection.id);
+    const packages = packagesFromQuotas(buckets);
+    if (packages.length > 0) return aggregatePackages(packages);
   }
+
+  const snapshot = getUsageSnapshot(connection.id);
+  if (snapshot) {
+    const packages = packagesFromQuotas(snapshot.quotas);
+    if (packages.length > 0) return aggregatePackages(packages);
+  }
+
   const snap = connection.providerSpecificData?.quota;
+  if (Array.isArray(snap?.packages) && snap.packages.length > 0) return normalizeQuota(snap);
   if (snap && typeof snap === "object") {
     const resetAtMs = snap.resetAt ? new Date(snap.resetAt).getTime() : NaN;
     const remaining = Number(snap.remaining);
@@ -347,15 +361,22 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
         // Apply the short-lived optimistic discount so concurrent selectors within
         // the decay window do not all converge on the same "best" account against a
         // stale snapshot (audit item #6, snapshot lag stampede).
-        getQuota: withOptimisticDiscount((c) => resolveAccountQuota(c, providerId, model)),
+        getQuota: withOptimisticDiscount((c) => resolveAccountQuota(c, providerId)),
         weightRemaining: providerOverride.quotaWeightRemaining ?? settings.quotaWeightRemaining ?? 1.0,
         weightExpiry: providerOverride.quotaWeightExpiry ?? settings.quotaWeightExpiry ?? 0.5,
+        // Weighted fair share: spreads traffic in proportion to how much of each
+        // account's quota is about to expire, so one account is not drained to zero
+        // while the rest age out. See quotaScheduler.js.
+        weightFairShare: providerOverride.quotaFairShareWeight ?? settings.quotaFairShareWeight ?? 1.0,
         preferEarlierExpiry: providerOverride.quotaPreferEarlierExpiry ?? settings.quotaPreferEarlierExpiry ?? true,
       });
       connection = picked;
       if (connection && detail) {
         const scoreText = Number.isFinite(score) ? score.toFixed(3) : "n/a";
-        log.debug("AUTH", `${provider} | quota-weighted pick ${connection.id?.slice(0, 8)} score=${scoreText} remaining=${detail.remaining ?? "n/a"} msToExpiry=${detail.msUntilExpiry ?? "n/a"}`);
+        const pkgText = detail.atRisk === null
+          ? "noExpiringQuota"
+          : `${detail.activePackage || "quota"}=${Math.round(detail.atRisk)}/${Math.round((detail.msUntilDeadline ?? 0) / 1000)}s`;
+        log.debug("AUTH", `${provider} | quota-weighted pick ${connection.id?.slice(0, 8)} score=${scoreText} remaining=${detail.remaining ?? "n/a"} atRisk[${pkgText}] share=${detail.share === null ? "n/a" : detail.share.toFixed(3)} deficit=${detail.deficit === null ? "n/a" : detail.deficit.toFixed(2)}`);
       }
     }
 

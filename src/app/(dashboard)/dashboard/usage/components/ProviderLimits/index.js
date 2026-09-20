@@ -24,6 +24,8 @@ import {
   shouldResetPage,
   getPaginationPageValue,
   getProviderOptions,
+  sumQuotaPoints,
+  formatPoints,
   reconcileConnectionsPage,
   getQuotaCache,
   setQuotaCache,
@@ -63,6 +65,24 @@ const AUTO_PING_SETTINGS_KEYS = {
 const AUTO_PING_TOOLTIPS = {
   claude: "When your 5h quota runs out, auto-sends a request the moment it resets so a new window starts right away.",
   codex: "Auto-starts the next 5h Codex window after reset by sending a tiny gpt-5.5 request. Consumes a small amount of quota.",
+};
+
+// Providers that support daily check-in (sign-in rewards).
+const CHECKIN_SETTINGS_KEYS = {
+  "codebuddy-cn": "codebuddyCheckin",
+};
+
+const CHECKIN_TOOLTIPS = {
+  "codebuddy-cn": "When enabled, automatically performs the daily CodeBuddy CN check-in once per day.",
+};
+
+const CHECKIN_STATUS_META = {
+  ok: { label: "Checked in", tone: "text-emerald-600 dark:text-emerald-400" },
+  already: { label: "Already checked in", tone: "text-emerald-600 dark:text-emerald-400" },
+  dry: { label: "Ready", tone: "text-text-muted" },
+  skip: { label: "Skipped", tone: "text-text-muted" },
+  fail: { label: "Failed", tone: "text-red-600 dark:text-red-400" },
+  refresh_fail: { label: "Token refresh failed", tone: "text-red-600 dark:text-red-400" },
 };
 
 function kiroMethodLabel(conn) {
@@ -132,6 +152,11 @@ export default function ProviderLimits() {
   const [errors, setErrors] = useState({});
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [autoPingMaps, setAutoPingMaps] = useState({ claude: {}, codex: {} });
+  const [checkinMaps, setCheckinMaps] = useState({ "codebuddy-cn": {} });
+  const [checkinBusy, setCheckinBusy] = useState(false);
+  const [checkinBusyIds, setCheckinBusyIds] = useState({});
+  const [checkinResults, setCheckinResults] = useState({});
+  const [checkinNotice, setCheckinNotice] = useState(null);
   const [lastUpdated, setLastUpdated] = useState(null);
   const [hasHydratedAutoRefresh, setHasHydratedAutoRefresh] = useState(false);
   const [refreshingAll, setRefreshingAll] = useState(false);
@@ -546,6 +571,9 @@ export default function ProviderLimits() {
           claude: s?.claudeAutoPing?.connections || {},
           codex: s?.codexAutoPing?.connections || {},
         });
+        setCheckinMaps({
+          "codebuddy-cn": s?.codebuddyCheckin?.connections || {},
+        });
         setQuotaVisibility(s?.quotaVisibility || {});
       })
       .catch(() => {});
@@ -572,6 +600,98 @@ export default function ProviderLimits() {
       setAutoPingMaps(previous);
     }
   }, [autoPingMaps]);
+
+  const toggleAutoCheckin = useCallback(async (connectionId, provider, on) => {
+    const settingsKey = CHECKIN_SETTINGS_KEYS[provider];
+    if (!settingsKey) return;
+
+    const previous = checkinMaps;
+    const nextProviderMap = { ...(checkinMaps[provider] || {}), [connectionId]: on };
+    const nextMaps = { ...checkinMaps, [provider]: nextProviderMap };
+    setCheckinMaps(nextMaps);
+    try {
+      const r = await fetch("/api/settings", { cache: "no-store" });
+      const s = r.ok ? await r.json() : {};
+      const cfg = { ...(s[settingsKey] || {}), connections: nextProviderMap };
+      await fetch("/api/settings", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ [settingsKey]: cfg }),
+      });
+    } catch {
+      setCheckinMaps(previous);
+    }
+  }, [checkinMaps]);
+
+  // Check in a single account.
+  const handleCheckinOne = useCallback(async (connectionId) => {
+    setCheckinBusyIds((prev) => ({ ...prev, [connectionId]: true }));
+    setCheckinNotice(null);
+    try {
+      const response = await fetch(`/api/providers/${connectionId}/checkin`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      const data = await response.json().catch(() => ({}));
+      const result = data?.result;
+      if (result) {
+        setCheckinResults((prev) => ({ ...prev, [connectionId]: result }));
+        if (result.status === "ok" || result.status === "already") {
+          setCheckinNotice({ type: "success", message: result.message || "Check-in complete" });
+        } else {
+          setCheckinNotice({ type: "error", message: result.message || "Check-in failed" });
+        }
+      } else if (!response.ok) {
+        setCheckinNotice({ type: "error", message: data?.error || "Check-in failed" });
+      }
+    } catch (error) {
+      setCheckinNotice({ type: "error", message: error.message || "Check-in failed" });
+    } finally {
+      setCheckinBusyIds((prev) => ({ ...prev, [connectionId]: false }));
+    }
+  }, []);
+
+  // One-click: check in all CodeBuddy CN accounts.
+  const handleCheckinAll = useCallback(async () => {
+    if (checkinBusy) return;
+    setCheckinBusy(true);
+    setCheckinNotice(null);
+    try {
+      const response = await fetch("/api/providers/checkin", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      const data = await response.json().catch(() => ({}));
+      const results = Array.isArray(data?.results) ? data.results : [];
+      if (results.length > 0) {
+        const next = {};
+        for (const r of results) {
+          if (r?.id) next[r.id] = r;
+        }
+        setCheckinResults((prev) => ({ ...prev, ...next }));
+      }
+      const summary = data?.summary;
+      if (summary) {
+        const parts = [];
+        if (summary.ok) parts.push(`${summary.ok} checked in`);
+        if (summary.already) parts.push(`${summary.already} already`);
+        if (summary.fail) parts.push(`${summary.fail} failed`);
+        if (summary.skip) parts.push(`${summary.skip} skipped`);
+        setCheckinNotice({
+          type: summary.fail ? "error" : "success",
+          message: `${summary.total} account${summary.total === 1 ? "" : "s"}: ${parts.join(", ") || "no changes"}`,
+        });
+      } else if (!response.ok) {
+        setCheckinNotice({ type: "error", message: data?.error || "Check-in failed" });
+      }
+    } catch (error) {
+      setCheckinNotice({ type: "error", message: error.message || "Check-in failed" });
+    } finally {
+      setCheckinBusy(false);
+    }
+  }, [checkinBusy]);
 
   const updateQuotaVisibility = useCallback(async (nextVisibility, previousVisibility) => {
     setQuotaVisibility(nextVisibility);
@@ -766,10 +886,34 @@ export default function ProviderLimits() {
     bulkSetActive(ids, true);
   };
 
+  // Points rolled up over the accounts currently listed: total / used / available.
+  // Only accounts whose quota is already loaded contribute, so the counters describe
+  // exactly the rows on screen (labelled as such in the UI).
+  const pointsTotals = useMemo(() => {
+    const summary = { total: 0, used: 0, available: 0, packages: 0, accounts: 0, hasData: false };
+    for (const conn of sortedConnections) {
+      const perAccount = sumQuotaPoints(quotaData[conn.id]?.quotas);
+      if (!perAccount.hasData) continue;
+      summary.total += perAccount.total;
+      summary.used += perAccount.used;
+      summary.available += perAccount.available;
+      summary.packages += perAccount.packages;
+      summary.accounts += 1;
+      summary.hasData = true;
+    }
+    return summary;
+  }, [sortedConnections, quotaData]);
+
   const selectedProviderLabel =
     providerFilter === "all" ? "All providers" : providerFilter;
   const hasEligibleConnections = totals.eligibleConnections > 0;
   const hasVisibleConnections = sortedConnections.length > 0;
+  const hasCheckinProvider = useMemo(
+    () =>
+      connections.some((c) => CHECKIN_SETTINGS_KEYS[c.provider]) ||
+      providerOptions.some((o) => CHECKIN_SETTINGS_KEYS[typeof o === "string" ? o : o?.value ?? o?.provider]),
+    [connections, providerOptions],
+  );
   const emptyState = getConnectionsEmptyMessage(
     totals,
     providerFilter,
@@ -1031,8 +1175,73 @@ export default function ProviderLimits() {
               refresh
             </span>
           </button>
+
+          {/* One-click daily check-in for all supported accounts */}
+          {hasCheckinProvider && (
+            <button
+              type="button"
+              onClick={handleCheckinAll}
+              disabled={checkinBusy}
+              className="flex h-8 shrink-0 items-center gap-1 rounded-lg border border-black/10 px-2 text-xs text-text-primary transition-colors hover:bg-black/5 dark:border-white/10 dark:hover:bg-white/5 disabled:opacity-50"
+              title="Check in all supported accounts"
+            >
+              <span
+                className={`material-symbols-outlined text-[14px] ${checkinBusy ? "animate-spin" : ""}`}
+              >
+                {checkinBusy ? "progress_activity" : "how_to_reg"}
+              </span>
+              <span className="hidden sm:inline">Check in all</span>
+            </button>
+          )}
         </div>
       </div>
+
+      {/* Points roll-up for the selected provider(s) */}
+      {pointsTotals.hasData && (
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 rounded-xl border border-black/10 bg-black/[0.02] px-3 py-2 text-xs dark:border-white/10 dark:bg-white/[0.03]">
+          <span className="flex items-center gap-1.5 font-medium capitalize text-text-primary">
+            <span className="material-symbols-outlined text-[15px] text-primary">
+              payments
+            </span>
+            {selectedProviderLabel}
+          </span>
+          <span className="text-text-muted">
+            Total{" "}
+            <b className="tabular-nums text-text-primary">
+              {formatPoints(pointsTotals.total)}
+            </b>
+          </span>
+          <span className="text-text-muted">
+            Used{" "}
+            <b className="tabular-nums text-amber-600 dark:text-amber-400">
+              {formatPoints(pointsTotals.used)}
+            </b>
+          </span>
+          <span className="text-text-muted">
+            Available{" "}
+            <b className="tabular-nums text-emerald-600 dark:text-emerald-400">
+              {formatPoints(pointsTotals.available)}
+            </b>
+          </span>
+          <span className="ml-auto text-[10px] text-text-muted">
+            {pointsTotals.packages} package
+            {pointsTotals.packages === 1 ? "" : "s"} across {pointsTotals.accounts} loaded
+            account{pointsTotals.accounts === 1 ? "" : "s"}
+          </span>
+        </div>
+      )}
+
+      {checkinNotice && (
+        <div
+          className={`rounded-xl border px-3 py-2 text-xs ${
+            checkinNotice.type === "error"
+              ? "border-red-500/20 bg-red-500/10 text-red-600 dark:text-red-400"
+              : "border-emerald-500/20 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+          }`}
+        >
+          {checkinNotice.message}
+        </div>
+      )}
 
       {/* Provider cards: 2 columns, compact */}
       {expiringFirst && (
@@ -1057,6 +1266,9 @@ export default function ProviderLimits() {
           const rawQuotas = quota?.quotas || [];
           const visibleQuotas = filterQuotasByVisibility(conn.provider, rawQuotas, quotaVisibility);
           const hiddenQuotaRows = getHiddenQuotaRows(conn.provider, rawQuotas, quotaVisibility);
+          // Sum over ALL packages (hidden rows included) so the account total stays
+          // stable no matter which quota rows the operator chose to hide.
+          const accountPoints = sumQuotaPoints(rawQuotas);
 
           return (
             <Card
@@ -1090,6 +1302,28 @@ export default function ProviderLimits() {
                       {getConnectionSecondaryLabel(conn) ? (
                         <p className="text-[11px] text-text-muted/80 truncate">
                           {getConnectionSecondaryLabel(conn)}
+                        </p>
+                      ) : null}
+                      {accountPoints.hasData ? (
+                        <p className="mt-0.5 flex flex-wrap items-center gap-x-2 text-[11px] tabular-nums">
+                          <span className="text-text-muted">
+                            Total{" "}
+                            <b className="text-text-primary">
+                              {formatPoints(accountPoints.total)}
+                            </b>
+                          </span>
+                          <span className="text-text-muted">
+                            Used{" "}
+                            <b className="text-amber-600 dark:text-amber-400">
+                              {formatPoints(accountPoints.used)}
+                            </b>
+                          </span>
+                          <span className="text-text-muted">
+                            Available{" "}
+                            <b className="text-emerald-600 dark:text-emerald-400">
+                              {formatPoints(accountPoints.available)}
+                            </b>
+                          </span>
                         </p>
                       ) : null}
                       {conn.provider === "kiro" && (
@@ -1190,6 +1424,59 @@ export default function ProviderLimits() {
                           <span className="material-symbols-outlined text-[18px]">bolt</span>
                         </button>
                       </Tooltip>
+                    )}
+                    {CHECKIN_SETTINGS_KEYS[conn.provider] && (
+                      <>
+                        <Tooltip text="Daily check-in now">
+                          <button
+                            type="button"
+                            onClick={() => handleCheckinOne(conn.id)}
+                            disabled={rowBusy || checkinBusyIds[conn.id] === true}
+                            aria-label="Daily check-in now"
+                            className={`flex h-8 items-center justify-center gap-1 rounded-lg px-2 transition-colors hover:bg-black/5 dark:hover:bg-white/5 disabled:opacity-50 ${
+                              checkinResults[conn.id]?.status === "fail" ||
+                              checkinResults[conn.id]?.status === "refresh_fail"
+                                ? "text-red-500"
+                                : checkinResults[conn.id]?.status === "ok" ||
+                                    checkinResults[conn.id]?.status === "already"
+                                  ? "text-emerald-500"
+                                  : "text-text-muted"
+                            }`}
+                          >
+                            <span
+                              className={`material-symbols-outlined text-[18px] ${
+                                checkinBusyIds[conn.id] === true ? "animate-spin" : ""
+                              }`}
+                            >
+                              {checkinBusyIds[conn.id] === true ? "progress_activity" : "how_to_reg"}
+                            </span>
+                          </button>
+                        </Tooltip>
+                        <Tooltip text={CHECKIN_TOOLTIPS[conn.provider]}>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              toggleAutoCheckin(
+                                conn.id,
+                                conn.provider,
+                                !(checkinMaps[conn.provider]?.[conn.id] === true),
+                              )
+                            }
+                            aria-label="Toggle auto check-in"
+                            className={`flex h-8 w-8 items-center justify-center rounded-lg transition-colors hover:bg-black/5 dark:hover:bg-white/5 ${
+                              checkinMaps[conn.provider]?.[conn.id] === true
+                                ? "text-primary"
+                                : "text-text-muted"
+                            }`}
+                          >
+                            <span className="material-symbols-outlined text-[18px]">
+                              {checkinMaps[conn.provider]?.[conn.id] === true
+                                ? "event_available"
+                                : "event_busy"}
+                            </span>
+                          </button>
+                        </Tooltip>
+                      </>
                     )}
                     <Tooltip text="Refresh quota">
                       <button
