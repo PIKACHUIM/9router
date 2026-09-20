@@ -9,7 +9,7 @@ import { createRequestLogger } from "../utils/requestLogger.js";
 import { getModelTargetFormat, getModelSupportedFormats, getModelStrip, getModelUpstreamId, getModelType, PROVIDER_ID_TO_ALIAS } from "../config/providerModels.js";
 import { PROVIDERS } from "../config/providers.js";
 import { createErrorResult, parseUpstreamError, formatProviderError } from "../utils/error.js";
-import { HTTP_STATUS, TOKEN_SAVER_HEADER } from "../config/runtimeConfig.js";
+import { HTTP_STATUS, TOKEN_SAVER_HEADER, CONTEXT_BUDGET_HEADER, CONTEXT_BUDGET_ENABLED, CONTEXT_BUDGET_RATIO } from "../config/runtimeConfig.js";
 import { handleBypassRequest } from "../utils/bypassHandler.js";
 import { trackPendingRequest, appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
 import { getExecutor } from "../executors/index.js";
@@ -25,6 +25,7 @@ import { injectPonytail } from "../rtk/ponytail.js";
 import { compressMessages, formatRtkLog } from "../rtk/index.js";
 import { compressWithHeadroom, formatHeadroomLog, formatHeadroomSizeLog, isHeadroomPhantomSavings } from "../rtk/headroom.js";
 import { compressWithPxpipe } from "../rtk/pxpipe.js";
+import { trimToContextBudget, formatContextBudgetLog } from "../rtk/contextBudget.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { stripUnsupportedModalities } from "../translator/concerns/modality.js";
 import { prefetchRemoteImages } from "../translator/concerns/prefetch.js";
@@ -297,6 +298,27 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     if (pxpipeResult.body) translatedBody = pxpipeResult.body;
     if (pxpipeSummary?.applied) xf.push(`PXPIPE:${pxpipeSummary.imageCount}img`);
     try { onPxpipeEvent?.({ provider, model, ...pxpipeSummary }); } catch { /* stats must not break requests */ }
+  }
+
+  // Context-budget guard: LAST step before dispatch, so it sizes exactly what the
+  // provider will receive and sees every saver's output. Turns a hard upstream
+  // rejection ("prompt is too long" → HTTP 400) into a lossy-but-answered request.
+  // Default off; enable via CONTEXT_BUDGET_ENABLED=1, opt out per request with
+  // `x-9router-context-budget: off`.
+  const ctxBudgetOverride = clientRawRequest?.headers?.[CONTEXT_BUDGET_HEADER]?.toLowerCase();
+  if (tokenSaverEnabled && CONTEXT_BUDGET_ENABLED && ctxBudgetOverride !== "off" && ctxBudgetOverride !== "false") {
+    const caps = getCapabilitiesForModel(provider, model);
+    const budgetStats = trimToContextBudget(translatedBody, {
+      contextWindow: caps.contextWindow,
+      maxOutput: caps.maxOutput,
+      ratio: CONTEXT_BUDGET_RATIO,
+      format: finalFormat,
+      provider,
+      model,
+    });
+    const budgetLine = formatContextBudgetLog(budgetStats);
+    if (budgetLine) log?.warn?.("CTX", budgetLine);
+    if (budgetStats.applied) xf.push(`CTX:${budgetStats.trimmedCount}msg`);
   }
 
   if (xf.length && log?.line) log.line(reqTag, "⚙", xf.join(" · "));
