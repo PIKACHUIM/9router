@@ -2,7 +2,7 @@
  * Shared combo (model combo) handling with fallback support
  */
 
-import { checkFallbackError, formatRetryAfter } from "./accountFallback.js";
+import { checkFallbackError, formatRetryAfter, isRequestScopedError } from "./accountFallback.js";
 import { unavailableResponse } from "../utils/error.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { extractTextContent } from "../translator/formats/gemini.js";
@@ -339,6 +339,15 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
       // layer the right reaction to upstream contention is still to try the next
       // model, otherwise a transient 429 is surfaced straight to the client and
       // the whole point of a combo is lost.
+      // Request-scoped failures (context window exceeded, malformed payload, model
+      // unsupported) fail identically on every combo member, so trying the next
+      // model only multiplies the latency and buries the real cause behind a
+      // generic last-resort message. Surface the upstream error immediately.
+      if (isRequestScopedError(result.status, errorText)) {
+        log.warn("COMBO", `Model ${modelStr} rejected the request itself (${result.status}) — not trying other models`);
+        return result;
+      }
+
       if (!shouldFallback && !concurrencyLimited) {
         log.warn("COMBO", `Model ${modelStr} failed (no fallback)`, { status: result.status });
         return result;

@@ -1,4 +1,9 @@
-import { ERROR_RULES, BACKOFF_CONFIG, TRANSIENT_COOLDOWN_MS, classify429, CONCURRENCY_RETRY_BASE_MS, CONCURRENCY_RETRY_JITTER_MS, CONCURRENCY_RETRY_MAX } from "../config/errorConfig.js";
+import { ERROR_RULES, BACKOFF_CONFIG, TRANSIENT_COOLDOWN_MS, classify429, CONCURRENCY_RETRY_BASE_MS, CONCURRENCY_RETRY_JITTER_MS, CONCURRENCY_RETRY_MAX, REQUEST_SCOPED_PATTERNS } from "../config/errorConfig.js";
+
+/** Whether errorText carries any matchable content (non-null / non-empty). */
+function hasText(errorText) {
+  return errorText != null && errorText !== "";
+}
 
 /**
  * Calculate exponential backoff cooldown for rate limits (429)
@@ -10,6 +15,26 @@ export function getQuotaCooldown(backoffLevel = 0) {
   const level = Math.max(0, backoffLevel - 1);
   const cooldown = BACKOFF_CONFIG.base * Math.pow(2, level);
   return Math.min(cooldown, BACKOFF_CONFIG.max);
+}
+
+/**
+ * Detects errors caused by the REQUEST itself rather than by the account:
+ * the prompt exceeds the model's context window, the payload is malformed, ...
+ *
+ * Rotating accounts cannot fix these — every account fails identically — so they
+ * must NOT exclude an account nor bump its backoff, otherwise a single oversized
+ * request walks the whole pool, locks every account for minutes, and surfaces as
+ * "all accounts locked (reset after Ns)" pointing at a quota problem that does not
+ * exist. The upstream status/message is returned to the client instead (400).
+ *
+ * @param {number|string} status - HTTP status code
+ * @param {string} errorText - Error message text
+ * @returns {boolean}
+ */
+export function isRequestScopedError(status, errorText) {
+  if (!hasText(errorText)) return false;
+  const text = String(errorText).toLowerCase();
+  return REQUEST_SCOPED_PATTERNS.some((p) => text.includes(p));
 }
 
 /**
@@ -33,6 +58,14 @@ export function checkFallbackError(status, errorText, backoffLevel = 0) {
   const kind429 = classify429(status, lowerError);
   if (kind429 === "concurrency") {
     return { shouldFallback: false, cooldownMs: 0, concurrencyLimited: true };
+  }
+
+  // Request-scoped errors (context window exceeded, malformed payload, ...) fail
+  // identically on EVERY account, so failover is pointless and harmful: it would
+  // lock the whole pool for the request's own fault. Short-circuit before the
+  // ERROR_RULES scan (whose "capacity" rule otherwise matches "context limit").
+  if (isRequestScopedError(status, lowerError)) {
+    return { shouldFallback: false, cooldownMs: 0 };
   }
 
   for (const rule of ERROR_RULES) {
@@ -65,7 +98,7 @@ export function checkFallbackError(status, errorText, backoffLevel = 0) {
  * @param {string} errorText
  */
 export function isConcurrencyLimited(status, errorText) {
-  const text = errorText
+  const text = hasText(errorText)
     ? (typeof errorText === "string" ? errorText : JSON.stringify(errorText)).toLowerCase()
     : "";
   return classify429(status, text) === "concurrency";
