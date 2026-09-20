@@ -67,6 +67,23 @@ export const DEFAULT_MIN_TOKENS = 32000;
 
 export const TOKEN_SAVER_HEADER = "x-9router-token-saver";
 
+// Context-budget guard (see open-sse/rtk/contextBudget.js).
+// Auto-trims over-long prompts locally so the upstream does not reject them with
+// "prompt is too long". Default OFF: trimming is lossy and only becomes necessary
+// on providers whose window is smaller than the client believes — when enabled,
+// per-request opt-out is available via `x-9router-context-budget: off`.
+export const CONTEXT_BUDGET_HEADER = "x-9router-context-budget";
+export const CONTEXT_BUDGET_ENABLED = process.env.CONTEXT_BUDGET_ENABLED === "1";
+// Fraction of the model window a prompt may occupy (rest absorbs output + estimator error).
+export const CONTEXT_BUDGET_RATIO = envRatio("CONTEXT_BUDGET_RATIO", 0.6);
+
+function envRatio(name, def) {
+  const raw = process.env[name];
+  if (raw == null || raw === "") return def;
+  const n = parseFloat(raw);
+  return Number.isFinite(n) && n > 0 && n <= 1 ? n : def;
+}
+
 // Retry config for 429 responses (legacy - kept for backward compatibility)
 export const RETRY_CONFIG = {
   maxAttempts: 2,
