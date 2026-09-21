@@ -1566,7 +1566,7 @@ export default function ProfilePage() {
                 {[
                   { value: "fill-first", label: "Fill First", desc: "Use highest-priority account first" },
                   { value: "round-robin", label: "Round Robin", desc: "Rotate across accounts" },
-                  { value: "quota-weighted", label: "Quota Weighted", desc: "Score by remaining quota × time-to-expiry" },
+                  { value: "quota-weighted", label: "Quota Weighted", desc: "Spread traffic so every account's soon-expiring quota is burned in time" },
                 ].map((opt) => (
                   <button
                     key={opt.value}
