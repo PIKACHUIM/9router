@@ -2,9 +2,28 @@ name: Build and Push Docker Image
 
 on:
   push:
+    # master 推送即自动构建（滚动 latest），无需再手动打 tag。
+    branches:
+      - master
+    # 发布 tag 依旧构建（GitHub 的 paths 筛选只对分支推送生效，
+    # 不会限制 tag 推送，所以打 tag 一定会触发）。
     tags:
       - "v*"
+    paths:
+      - "src/**"
+      - "open-sse/**"
+      - "public/**"
+      - "custom-server.js"
+      - "package*.json"
+      - "next.config.*"
+      - "Dockerfile"
+      - ".github/workflows/docker-publish.yml"
   workflow_dispatch:
+
+# 同一 ref 上重复触发时取消上一次未完成的构建，避免 master 连续推送时排队。
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-and-push:
@@ -68,8 +87,9 @@ jobs:
             ${{ steps.img.outputs.GHCR_IMAGE }}
             ${{ steps.img.outputs.DOCKERHUB_IMAGE }}
           tags: |
+            # tag 推送（v*）→ 版本号标签；master 推送 → 滚动 latest（二者都会更新 latest）
             type=semver,pattern={{version}}
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || startsWith(github.ref, 'refs/tags/v') }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
