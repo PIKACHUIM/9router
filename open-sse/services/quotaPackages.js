@@ -220,3 +220,41 @@ export function sumPackageRemaining(packages) {
   if (!Array.isArray(packages)) return 0;
   return packages.reduce((sum, p) => sum + (Number.isFinite(p?.remaining) ? p.remaining : 0), 0);
 }
+
+/**
+ * Sum a package list into the "Total / Used / Available" points summary.
+ *
+ * The convention is per-package summation: an account's total is the sum over EVERY
+ * allowance it holds, so a CodeBuddy account with a refill pack plus three bonus packs
+ * reports all four added up rather than just one row.
+ *
+ * Mirrors `sumQuotaPoints` in the usage page's utils.js — that one sums already-parsed
+ * quota ROWS, this one sums scheduler packages. Both apply the same rule; keep them in
+ * step if the rule changes.
+ *
+ * A package with no finite total (a provider that only reports a remaining balance)
+ * contributes to `available` and `count` but to neither `total` nor `used`, because
+ * inventing a total for it would silently distort the account's headline number.
+ *
+ * @param {Array<object>} packages
+ * @returns {{ total:number, used:number, available:number, count:number }}
+ */
+export function summarizePackages(packages) {
+  const summary = { total: 0, used: 0, available: 0, count: 0 };
+
+  for (const pkg of packages || []) {
+    const remaining = Number(pkg?.remaining);
+    if (!Number.isFinite(remaining)) continue;
+
+    summary.count += 1;
+    summary.available += Math.max(0, remaining);
+
+    const total = Number(pkg?.total);
+    if (Number.isFinite(total) && total > 0) {
+      summary.total += total;
+      summary.used += Math.max(0, total - remaining);
+    }
+  }
+
+  return summary;
+}

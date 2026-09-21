@@ -457,6 +457,8 @@ export default function SchedulingDiagnosticsPage() {
             ["Quota weight (remaining)", settings.quotaWeightRemaining],
             ["Quota weight (expiry)", settings.quotaWeightExpiry],
             ["Quota fair share weight", settings.quotaFairShareWeight],
+            ["Usage snapshot warm-up", settings.usageSnapshotWarmupEnabled ? "on" : "off"],
+            ["Accounts with cached quota", data?.usageSnapshots?.connections ?? 0],
             ["Probe enabled", settings.sessionProbeEnabled ? "on" : "off"],
           ].map(([label, value]) => (
             <div

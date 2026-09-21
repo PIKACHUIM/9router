@@ -119,6 +119,14 @@ async function runHeavyStartup() {
       .catch((e) => console.log("[Checkin] scheduler start failed:", e.message));
   }
 
+  // Usage snapshot warm-up: keeps quota-weighted scheduling working without anybody
+  // having to open the usage page. Defaults ON (see DEFAULT_SETTINGS).
+  if (settings.usageSnapshotWarmupEnabled !== false) {
+    import("@/shared/services/usageSnapshotScheduler")
+      .then(({ startUsageSnapshotWarmup }) => startUsageSnapshotWarmup())
+      .catch((e) => console.log("[UsageWarmup] scheduler start failed:", e.message));
+  }
+
   // Proactive OAuth token refresh (e.g. grok-cli ~6h TTL). Module is idempotent
   // and also started from custom-server.js when that entry is used.
   import("@/sse/services/backgroundTokenRefresh.js")

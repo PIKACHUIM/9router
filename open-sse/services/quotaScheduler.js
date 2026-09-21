@@ -297,6 +297,11 @@ export function scoreAccounts(candidates, opts = {}) {
  * `score` is returned alongside `detail` because callers log it; it lives on the
  * scored entry (a sibling of `detail`), not inside `detail`.
  *
+ * Convenience wrapper for callers that only need the winner. `getProviderCredentials`
+ * deliberately calls `scoreAccounts` instead: it also needs the FULL ranking, because
+ * the concurrency gate may have to walk past a saturated pick and that walk must
+ * continue down the same order.
+ *
  * @returns {{ connection: object|null, score: number|null, detail: object|null }}
  */
 export function pickQuotaWeighted(candidates, opts = {}) {

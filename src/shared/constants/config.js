@@ -92,6 +92,27 @@ export const QUOTA_AUTOPING_CONFIG = {
   },
 };
 
+// Usage snapshot warm-up: keeps the quota-weighted scheduler's allowance cache fresh
+// without anyone having to open the dashboard.
+//
+// The scheduler reads each account's live quota packages from an in-memory cache that
+// GET /api/usage/[connectionId] publishes into. That endpoint is only called by the
+// usage page and by the auto-ping tick, so on an install nobody is watching, the cache
+// stays empty and quota-weighted scheduling silently falls back to its legacy scoring.
+// This loop walks the accounts itself at a deliberately low frequency.
+//
+// Deliberately gentle: it reuses the SAME usage endpoints the dashboard already calls,
+// one account may be polled at most once per perConnectionMinIntervalMs (30 min, i.e.
+// >= the 10 min cadence the claude usage endpoint tolerates), at most perTickLimit calls
+// are made per tick so a large install spreads out instead of bursting, and an account
+// whose call fails is left alone for failureCooldownMs.
+export const USAGE_SNAPSHOT_CONFIG = {
+  tickIntervalMs: 60 * 1000,            // scheduler tick
+  perConnectionMinIntervalMs: 30 * 60 * 1000,
+  failureCooldownMs: 30 * 60 * 1000,
+  perTickLimit: 20,                     // upstream calls allowed per tick
+};
+
 // Daily check-in: auto sign-in for supported providers (currently CodeBuddy CN).
 export const CHECKIN_CONFIG = {
   tickIntervalMs: 30 * 60 * 1000,       // scheduler tick (30min) — cheap: only hits API when not yet checked in

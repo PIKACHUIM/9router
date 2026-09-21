@@ -1660,6 +1660,23 @@ export default function ProfilePage() {
               </>
             )}
 
+            {/* Usage snapshot warm-up */}
+            <div className="flex items-start sm:items-center justify-between gap-4 pt-4 border-t border-border/50">
+              <div className="flex-1 min-w-0">
+                <p className="font-medium text-sm sm:text-base">Usage Snapshot Warm-up</p>
+                <p className="text-xs sm:text-sm text-text-muted">
+                  Refresh each account&apos;s quota in the background so scheduling has live
+                  per-package data without anyone opening the Usage page. Reuses the same
+                  endpoints the dashboard reads, at most once per account per 30 minutes.
+                </p>
+              </div>
+              <Toggle
+                checked={settings.usageSnapshotWarmupEnabled !== false}
+                onChange={() => patchSettings({ usageSnapshotWarmupEnabled: !(settings.usageSnapshotWarmupEnabled !== false) })}
+                disabled={loading}
+              />
+            </div>
+
             {/* Session affinity */}
             <div className="flex items-start sm:items-center justify-between gap-4 pt-4 border-t border-border/50">
               <div className="flex-1 min-w-0">

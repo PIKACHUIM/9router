@@ -39,3 +39,17 @@ export function getRelativeTime(isoDate) {
   return `${days}d ago`;
 }
 
+/**
+ * Format a points/quota total for display, keeping fractional balances readable.
+ * Shared by the usage page and the provider account rows so the same number never
+ * renders two different ways.
+ *
+ * @param {number} value
+ * @returns {string}
+ */
+export function formatPoints(value) {
+  if (!Number.isFinite(value)) return "–";
+  const rounded = Math.round(value * 100) / 100;
+  return rounded.toLocaleString(undefined, { maximumFractionDigits: 2 });
+}
+

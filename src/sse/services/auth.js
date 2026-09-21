@@ -6,7 +6,7 @@ import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.
 import { getAntigravityQuotaCache } from "./antigravityQuota.js";
 import { acquire as acquireAccountSlot, release as releaseAccountSlotInternal, getLoad, DEFAULT_MAX_CONCURRENT_PER_ACCOUNT } from "open-sse/services/accountLoad.js";
 import { getBoundConnection, bindSession, getSessionCount, startSessionBindingSweeper } from "open-sse/services/sessionBindings.js";
-import { pickQuotaWeighted, withOptimisticDiscount, recordConsumption, releaseConsumption } from "open-sse/services/quotaScheduler.js";
+import { scoreAccounts, withOptimisticDiscount, recordConsumption, releaseConsumption } from "open-sse/services/quotaScheduler.js";
 import { packagesFromQuotas, aggregatePackages, normalizeQuota } from "open-sse/services/quotaPackages.js";
 import { getUsageSnapshot } from "open-sse/services/usageSnapshot.js";
 import * as log from "../utils/logger.js";
@@ -357,7 +357,15 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     }
 
     if (!connection && strategy === "quota-weighted") {
-      const { connection: picked, score, detail } = pickQuotaWeighted(candidates, {
+      // Scored once, but the FULL ranking is kept: the concurrency gate further down
+      // reserves a slot on the chosen account and, when it is saturated, walks
+      // `candidates` to find one that still has room. Walking the raw candidate list
+      // would fall back in session-cap-partition order, quietly discarding the
+      // spreading this mode exists for — and recording the fair-share unit against the
+      // wrong account. Reordering `candidates` by score makes that walk continue down
+      // the same ranking. Nothing else reads `candidates` after this point (only
+      // `.length` in two log lines), so the reorder is local to the gate.
+      const ranked = scoreAccounts(candidates, {
         // Apply the short-lived optimistic discount so concurrent selectors within
         // the decay window do not all converge on the same "best" account against a
         // stale snapshot (audit item #6, snapshot lag stampede).
@@ -370,9 +378,14 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
         weightFairShare: providerOverride.quotaFairShareWeight ?? settings.quotaFairShareWeight ?? 1.0,
         preferEarlierExpiry: providerOverride.quotaPreferEarlierExpiry ?? settings.quotaPreferEarlierExpiry ?? true,
       });
-      connection = picked;
-      if (connection && detail) {
-        const scoreText = Number.isFinite(score) ? score.toFixed(3) : "n/a";
+
+      const best = ranked[0] || null;
+      connection = best ? best.connection : null;
+      if (ranked.length > 0) candidates = ranked.map((scored) => scored.connection);
+
+      if (connection && best.detail) {
+        const scoreText = Number.isFinite(best.score) ? best.score.toFixed(3) : "n/a";
+        const detail = best.detail;
         const pkgText = detail.atRisk === null
           ? "noExpiringQuota"
           : `${detail.activePackage || "quota"}=${Math.round(detail.atRisk)}/${Math.round((detail.msUntilDeadline ?? 0) / 1000)}s`;

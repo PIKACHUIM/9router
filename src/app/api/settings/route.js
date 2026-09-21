@@ -126,6 +126,15 @@ export async function PATCH(request) {
         .catch((error) => console.warn("[Checkin] settings update failed:", error.message));
     }
 
+    // Start/stop the usage warm-up immediately instead of waiting for a restart.
+    if (Object.prototype.hasOwnProperty.call(body, "usageSnapshotWarmupEnabled")) {
+      import("@/shared/services/usageSnapshotScheduler")
+        .then(({ configureUsageSnapshotWarmup }) => {
+          configureUsageSnapshotWarmup(settings);
+        })
+        .catch((error) => console.warn("[UsageWarmup] settings update failed:", error.message));
+    }
+
     const { password, oidcClientSecret, ...safeSettings } = settings;
     safeSettings.oidcConfigured = !!(safeSettings.oidcIssuerUrl && safeSettings.oidcClientId && oidcClientSecret);
     return NextResponse.json(safeSettings, { headers: SETTINGS_RESPONSE_HEADERS });

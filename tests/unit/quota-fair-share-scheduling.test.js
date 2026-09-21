@@ -1,6 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
-  pickQuotaWeighted,
   scoreAccounts,
   recordConsumption,
   releaseConsumption,
@@ -12,6 +11,7 @@ import {
   pickActivePackage,
   normalizeQuota,
   aggregatePackages,
+  summarizePackages,
 } from "../../open-sse/services/quotaPackages.js";
 
 const HOUR = 60 * 60 * 1000;
@@ -129,17 +129,56 @@ describe("pickActivePackage", () => {
 // Spreading: the behaviour that replaces "drain whichever account expires first"
 // ---------------------------------------------------------------------------
 
-/** Run `count` sequential selections, recording each pick the way auth.js does. */
+// ---------------------------------------------------------------------------
+// Totals shown by the provider page
+// ---------------------------------------------------------------------------
+
+describe("summarizePackages", () => {
+  const now = 1_000_000_000_000;
+
+  it("sums every package an account holds", () => {
+    const list = packagesFromQuotas({
+      Monthly: { used: 6.54, total: 500, resetAt: new Date(now + DAY).toISOString() },
+      "Bonus Pack 1": { used: 10, total: 200, resetAt: new Date(now + 2 * DAY).toISOString() },
+      "Bonus Pack 2": { used: 0, total: 300, resetAt: new Date(now + 3 * DAY).toISOString() },
+    });
+
+    const sums = summarizePackages(list);
+    expect(sums.count).toBe(3);
+    expect(sums.total).toBe(1000);
+    expect(sums.used).toBeCloseTo(16.54, 2);
+    expect(sums.available).toBeCloseTo(983.46, 2);
+  });
+
+  it("counts a total-less package in available only, never inventing a total", () => {
+    expect(summarizePackages([{ remaining: 42, total: null }]))
+      .toEqual({ total: 0, used: 0, available: 42, count: 1 });
+  });
+
+  it("returns zeros for no packages", () => {
+    expect(summarizePackages([])).toEqual({ total: 0, used: 0, available: 0, count: 0 });
+    expect(summarizePackages(undefined)).toEqual({ total: 0, used: 0, available: 0, count: 0 });
+  });
+
+  it("clamps a spent package instead of going negative", () => {
+    expect(summarizePackages([{ remaining: 0, total: 100 }]))
+      .toEqual({ total: 100, used: 100, available: 0, count: 1 });
+  });
+});
+
+/**
+ * Run `count` sequential selections, recording each pick the way auth.js does: score,
+ * take the head, then consume. The ordered ranking is what auth.js hands to the
+ * concurrency gate, so the simulation reads it the same way.
+ */
 function simulate(accounts, count, opts = {}) {
   const picks = new Map(accounts.map((a) => [a.id, 0]));
   for (let i = 0; i < count; i += 1) {
-    const { connection } = pickQuotaWeighted(accounts, {
-      getQuota: (c) => c.quota,
-      ...opts,
-    });
-    if (!connection) break;
-    picks.set(connection.id, picks.get(connection.id) + 1);
-    recordConsumption(connection.id, 1);
+    const ranked = scoreAccounts(accounts, { getQuota: (c) => c.quota, ...opts });
+    const best = ranked[0];
+    if (!best) break;
+    picks.set(best.connection.id, picks.get(best.connection.id) + 1);
+    recordConsumption(best.connection.id, 1);
   }
   return picks;
 }
@@ -261,6 +300,21 @@ describe("quota-weighted spreading", () => {
     expect(getFairShareServed("abc")).toBeGreaterThan(0);
     releaseConsumption("abc", 1);
     expect(getFairShareServed("abc")).toBe(0);
+  });
+
+  it("ranks every candidate, not just the winner, so the concurrency fallback can follow it", () => {
+    resetOptimistic();
+    const now = Date.now();
+    const accounts = [
+      { id: "a", quota: accountQuota([{ name: "Monthly", remaining: 900, resetAtMs: now + 30 * DAY, recurring: false }]) },
+      { id: "b", quota: accountQuota([{ name: "Monthly", remaining: 100, resetAtMs: now + 30 * DAY, recurring: false }]) },
+      { id: "c", quota: null },
+    ];
+
+    const ranked = scoreAccounts(accounts, { getQuota: (q) => q.quota });
+    expect(ranked).toHaveLength(3);
+    const scores = ranked.map((r) => r.score);
+    expect(scores).toEqual([...scores].sort((x, y) => y - x));
   });
 
   it("still lets in-flight load break a tie between equally urgent accounts", () => {

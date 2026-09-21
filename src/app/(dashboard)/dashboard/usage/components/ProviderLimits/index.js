@@ -25,7 +25,6 @@ import {
   getPaginationPageValue,
   getProviderOptions,
   sumQuotaPoints,
-  formatPoints,
   reconcileConnectionsPage,
   getQuotaCache,
   setQuotaCache,
@@ -44,6 +43,7 @@ import Card from "@/shared/components/Card";
 import { ConfirmModal, EditConnectionModal } from "@/shared/components";
 import { USAGE_SUPPORTED_PROVIDERS } from "@/shared/constants/providers";
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
+import { formatPoints } from "@/shared/utils";
 
 // Maps the stored providerSpecificData.authMethod to a human label for Kiro.
 // Values come from the Kiro connect flows: builder-id/idc (device code),

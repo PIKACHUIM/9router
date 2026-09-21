@@ -5,6 +5,7 @@ import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import Image from "next/image";
 import { getProviderIconSrc, markProviderIconMissing } from "@/shared/utils/providerIcon";
+import { formatPoints } from "@/shared/utils";
 import { Card, Button, Badge, Input, Modal, CardSkeleton, OAuthModal, KiroOAuthWrapper, CursorAuthModal, XiaomiMimoAuthModal, IFlowCookieModal, GitLabAuthModal, Toggle, Select, EditConnectionModal, NoAuthProxyCard, ConfirmModal } from "@/shared/components";
 import { OAUTH_PROVIDERS, APIKEY_PROVIDERS, FREE_PROVIDERS, FREE_TIER_PROVIDERS, WEB_COOKIE_PROVIDERS, getProviderAlias, isOpenAICompatibleProvider, isAnthropicCompatibleProvider, AI_PROVIDERS } from "@/shared/constants/providers";
 import { getModelsByProviderId, getModelKind } from "@/shared/constants/models";
@@ -68,6 +69,10 @@ export default function ProviderDetailPage() {
   // Which bulk enable/disable run is in flight ("enable" | "disable" | null) so the two
   // buttons can show progress and stay disabled while the loop runs.
   const [bulkTogglingActive, setBulkTogglingActive] = useState(null);
+  // Allowance totals per account, read back from the server's usage cache — the same
+  // cache quota-weighted scheduling consumes — so this page shows what scheduling sees
+  // without spending an upstream request of its own.
+  const [usageTotals, setUsageTotals] = useState({ totals: {}, summary: null });
   const [providerStrategy, setProviderStrategy] = useState(null);
   const [providerStickyLimit, setProviderStickyLimit] = useState("");
   const [thinkingMode, setThinkingMode] = useState("auto");
@@ -301,6 +306,28 @@ export default function ProviderDetailPage() {
       .then((data) => { if (data.models?.length) setKiloFreeModels(data.models); })
       .catch(() => {});
   }, [providerId]);
+
+  const fetchUsageTotals = useCallback(async () => {
+    try {
+      const res = await fetch(
+        `/api/providers/usage-totals?provider=${encodeURIComponent(providerId)}`,
+        { cache: "no-store" }
+      );
+      if (!res.ok) return;
+      const data = await res.json();
+      setUsageTotals({ totals: data.totals || {}, summary: data.summary || null });
+    } catch (error) {
+      console.log("Error fetching usage totals:", error);
+    }
+  }, [providerId]);
+
+  // Cheap to poll (in-memory server read, no upstream calls) and refetched whenever the
+  // connection list changes so a delete/disable immediately updates the roll-up.
+  useEffect(() => {
+    fetchUsageTotals();
+    const timer = setInterval(fetchUsageTotals, 60000);
+    return () => clearInterval(timer);
+  }, [fetchUsageTotals, connections.length]);
 
   const fetchConnections = useCallback(async () => {
     try {
@@ -1083,6 +1110,7 @@ export default function ProviderDetailPage() {
                 }}
                 onDelete={() => handleDelete(conn.id)}
                 oneByOneStatus={oneByOneResults[conn.id] || null}
+                points={usageTotals.totals[conn.id] || null}
               />
             </div>
           </div>
@@ -1624,6 +1652,38 @@ export default function ProviderDetailPage() {
               </div>
             </div>
           </div>
+
+          {/* Allowance roll-up for every account of this provider. Hidden entirely until
+              at least one account has quota data, so it never shows a fake 0. */}
+          {usageTotals.summary?.accounts > 0 && (
+            <div className="mb-4 flex flex-wrap items-center gap-x-4 gap-y-1.5 rounded-xl border border-black/10 bg-black/[0.02] px-3 py-2 text-xs dark:border-white/10 dark:bg-white/[0.03]">
+              <span className="flex items-center gap-1.5 font-medium text-text-main">
+                <span className="material-symbols-outlined text-[15px] text-primary">payments</span>
+                Account points
+              </span>
+              <span className="text-text-muted">
+                Total{" "}
+                <b className="tabular-nums text-text-main">{formatPoints(usageTotals.summary.total)}</b>
+              </span>
+              <span className="text-text-muted">
+                Used{" "}
+                <b className="tabular-nums text-amber-600 dark:text-amber-400">
+                  {formatPoints(usageTotals.summary.used)}
+                </b>
+              </span>
+              <span className="text-text-muted">
+                Available{" "}
+                <b className="tabular-nums text-emerald-600 dark:text-emerald-400">
+                  {formatPoints(usageTotals.summary.available)}
+                </b>
+              </span>
+              <span className="ml-auto text-[10px] text-text-muted">
+                {usageTotals.summary.packages} package
+                {usageTotals.summary.packages === 1 ? "" : "s"} across {usageTotals.summary.accounts} of{" "}
+                {connections.length} account{connections.length === 1 ? "" : "s"}
+              </span>
+            </div>
+          )}
 
           {connections.length === 0 ? (
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">

@@ -4,9 +4,10 @@ import { useState, useEffect, useRef } from "react";
 import { getStatusVariant as getConnectionStatusVariant } from "@/shared/utils/connectionStatus";
 import PropTypes from "prop-types";
 import { Badge, Toggle, Tooltip } from "@/shared/components";
+import { formatPoints } from "@/shared/utils";
 import CooldownTimer from "./CooldownTimer";
 
-export default function ConnectionRow({ connection, proxyPools, isOAuth, isFirst, isLast, onMoveUp, onMoveDown, onToggleActive, onUpdateProxy, onEdit, onDelete, oneByOneStatus = null, autoPing = null }) {
+export default function ConnectionRow({ connection, proxyPools, isOAuth, isFirst, isLast, onMoveUp, onMoveDown, onToggleActive, onUpdateProxy, onEdit, onDelete, oneByOneStatus = null, autoPing = null, points = null }) {
   const [showProxyDropdown, setShowProxyDropdown] = useState(false);
   const [updatingProxy, setUpdatingProxy] = useState(false);
   const proxyDropdownRef = useRef(null);
@@ -191,6 +192,24 @@ export default function ConnectionRow({ connection, proxyPools, isOAuth, isFirst
               </Badge>
             )}
           </div>
+          {points && points.count > 0 && (
+            <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] tabular-nums">
+              <span className="text-text-muted">
+                Total <b className="text-text-main">{formatPoints(points.total)}</b>
+              </span>
+              <span className="text-text-muted">
+                Used <b className="text-amber-600 dark:text-amber-400">{formatPoints(points.used)}</b>
+              </span>
+              <span className="text-text-muted">
+                Available <b className="text-emerald-600 dark:text-emerald-400">{formatPoints(points.available)}</b>
+              </span>
+              <Tooltip text="From the connection's stored snapshot. Open the Usage page, or turn on Usage Snapshot Warm-up, for live numbers.">
+                <span className="cursor-help rounded bg-black/5 px-1 text-[10px] text-text-muted dark:bg-white/5">
+                  cached
+                </span>
+              </Tooltip>
+            </div>
+          )}
           {hasAnyProxy && (
             <div className="mt-1 flex items-center gap-2 flex-wrap">
               <span className="max-w-full truncate text-[11px] text-text-muted sm:max-w-[420px]" title={proxyDisplayText}>
@@ -314,5 +333,12 @@ ConnectionRow.propTypes = {
     on: PropTypes.bool,
     onToggle: PropTypes.func,
     provider: PropTypes.string,
+  }),
+  points: PropTypes.shape({
+    total: PropTypes.number,
+    used: PropTypes.number,
+    available: PropTypes.number,
+    count: PropTypes.number,
+    source: PropTypes.string,
   }),
 };

@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { snapshotSessionProbe, isSessionProbeEnabled, setSessionProbeEnabled, startSessionProbe } from "open-sse/utils/sessionProbe.js";
 import { snapshotLoad, resetLoad } from "open-sse/services/accountLoad.js";
 import { snapshotBindings } from "open-sse/services/sessionBindings.js";
+import { snapshotUsageCache } from "open-sse/services/usageSnapshot.js";
 import { getSettings, updateSettings } from "@/lib/db/repos/settingsRepo";
 
 export const dynamic = "force-dynamic";
@@ -31,11 +32,15 @@ export async function GET() {
         quotaWeightRemaining: settings.quotaWeightRemaining,
         quotaWeightExpiry: settings.quotaWeightExpiry,
         quotaFairShareWeight: settings.quotaFairShareWeight,
+        usageSnapshotWarmupEnabled: settings.usageSnapshotWarmupEnabled,
         sessionProbeEnabled: settings.sessionProbeEnabled,
       },
       sessionProbe: snapshotSessionProbe(),
       accountLoad: snapshotLoad(),
       sessionBindings: snapshotBindings(),
+      // Size of the allowance cache the scorer reads: the quickest way to tell whether
+      // quota-weighted scheduling actually has per-package data to work with.
+      usageSnapshots: snapshotUsageCache(),
     });
   } catch (err) {
     return NextResponse.json({ ok: false, error: String(err?.message || err) }, { status: 500 });

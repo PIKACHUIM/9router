@@ -110,6 +110,14 @@ const DEFAULT_SETTINGS = {
   quotaFairShareWeight: 1.0,
   // Exponential-backoff lock still applies to genuine (quota) 429s.
   // Concurrency-429 never locks an account.
+  //
+  // ---- Usage snapshot warm-up ----
+  // Background refresh of each account's live allowance list, so quota-weighted
+  // scheduling has real per-package data even when nobody opens the usage page (that
+  // page and the auto-ping tick are otherwise the only writers of the cache). Reuses
+  // the very same usage endpoints, throttled to one call per account per 30 minutes.
+  // Turn off to make 9router completely passive about usage endpoints.
+  usageSnapshotWarmupEnabled: true,
 
   // ---- Diagnostics ----
   // Read-only session identity probe (no behaviour change). Also via env SESSION_PROBE=1.

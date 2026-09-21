@@ -357,13 +357,6 @@ export function sumQuotaPoints(quotas) {
   return summary;
 }
 
-/** Compact display for a points total (keeps fractional balances readable). */
-export function formatPoints(value) {
-  if (!Number.isFinite(value)) return "–";
-  const rounded = Math.round(value * 100) / 100;
-  return rounded.toLocaleString(undefined, { maximumFractionDigits: 2 });
-}
-
 export function getQuotaVisibilityKey(quota) {
   if (!quota || typeof quota !== "object") return "";
   return String(quota.modelKey || quota.name || "").trim();
