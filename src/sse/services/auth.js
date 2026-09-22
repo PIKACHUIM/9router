@@ -235,6 +235,8 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       || settings.schedulingMode
       || legacyStrategy;
     const strategy = schedulingMode === "quota-weighted" ? "quota-weighted" : legacyStrategy;
+    const preferEarlierExpiry = providerOverride.quotaPreferEarlierExpiry ?? settings.quotaPreferEarlierExpiry ?? true;
+    const expiryFirst = strategy === "quota-weighted" && preferEarlierExpiry;
 
     // ---- Concurrency gate + session affinity candidate pruning ----
     // Default OFF — must match DEFAULT_SETTINGS.sessionBindingEnabled in settingsRepo.js.
@@ -331,27 +333,9 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       }
     }
 
-    // ---- Session affinity short-circuit (applies to ALL scheduling modes) ----
-    // The bound account is only moved to the FRONT of `candidates` above, which is
-    // enough for fill-first but is silently discarded by round-robin (sorts by
-    // lastUsedAt) and quota-weighted (sorts by score). Since the UI lets affinity be
-    // combined with any mode, honour it here: if the session already has a healthy
-    // bound account, reuse it regardless of mode. That is the entire point of
-    // affinity — keeping the upstream prompt cache warm.
-    //
-    // The concurrency gate below can still fail over to another candidate if this
-    // account turns out to be saturated, so this is a preference, not a pin.
-    //
-    // Session-cap interaction: reusing the bound account does NOT grow its session
-    // count (getBoundConnection() only returns an account that already holds this
-    // session), so a bound account at its cap should NOT be treated as full for THIS
-    // session — evicting it here would rebind an established conversation to a cold
-    // account on every request, destroying the prompt cache affinity exists to keep.
-    //
-    // What must not happen is an account that is at cap ABSORBING additional sessions.
-    // That is enforced where new bindings are chosen (the fill-first branch below and
-    // bindSession's cap accounting), not here.
-    if (!connection && sessionBindingEnabled && sessionId && boundConnection) {
+    // Expiry-first affinity is applied after ranking, only within the earliest
+    // deadline. Other modes keep their existing session preference.
+    if (!connection && !expiryFirst && sessionBindingEnabled && sessionId && boundConnection) {
       connection = boundConnection;
       log.debug("AUTH", `${provider} | session affinity honoured in mode=${strategy} → ${boundConnection.id.slice(0, 8)}`);
     }
@@ -365,20 +349,30 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       // wrong account. Reordering `candidates` by score makes that walk continue down
       // the same ranking. Nothing else reads `candidates` after this point (only
       // `.length` in two log lines), so the reorder is local to the gate.
+      if (expiryFirst && sessionBindingEnabled && sessionId && maxSessions > 0) {
+        const withinCapacity = candidates.filter((c) =>
+          c.id === boundConnection?.id || getSessionCount(c.id) < maxSessions
+        );
+        if (withinCapacity.length > 0) candidates = withinCapacity;
+      }
+      const getQuota = (c) => resolveAccountQuota(c, providerId);
       const ranked = scoreAccounts(candidates, {
-        // Apply the short-lived optimistic discount so concurrent selectors within
-        // the decay window do not all converge on the same "best" account against a
-        // stale snapshot (audit item #6, snapshot lag stampede).
-        getQuota: withOptimisticDiscount((c) => resolveAccountQuota(c, providerId)),
+        // Request counts are not provider quota units. They must not erase a real
+        // small balance and make its deadline disappear before upstream confirms it.
+        getQuota: expiryFirst ? getQuota : withOptimisticDiscount(getQuota),
         weightRemaining: providerOverride.quotaWeightRemaining ?? settings.quotaWeightRemaining ?? 1.0,
         weightExpiry: providerOverride.quotaWeightExpiry ?? settings.quotaWeightExpiry ?? 0.5,
-        // Weighted fair share: spreads traffic in proportion to how much of each
-        // account's quota is about to expire, so one account is not drained to zero
-        // while the rest age out. See quotaScheduler.js.
         weightFairShare: providerOverride.quotaFairShareWeight ?? settings.quotaFairShareWeight ?? 1.0,
-        preferEarlierExpiry: providerOverride.quotaPreferEarlierExpiry ?? settings.quotaPreferEarlierExpiry ?? true,
+        preferEarlierExpiry,
+        getLoad,
       });
 
+      if (expiryFirst && boundConnection && ranked.length > 0) {
+        const boundIndex = ranked.findIndex((entry) => entry.connection.id === boundConnection.id);
+        if (boundIndex > 0 && ranked[boundIndex].detail.activeResetAtMs === ranked[0].detail.activeResetAtMs) {
+          ranked.unshift(...ranked.splice(boundIndex, 1));
+        }
+      }
       const best = ranked[0] || null;
       connection = best ? best.connection : null;
       if (ranked.length > 0) candidates = ranked.map((scored) => scored.connection);

@@ -10,18 +10,13 @@
  *     (see usage/google.js + usage/antigravity-weekly.js).
  *   - Everything else: at least the rolling window the usage endpoint reports.
  *
- * Scheduling "the account whose package expires first" concentrates all traffic on a
- * single account and lets every OTHER account's packages expire unused. What the
- * scheduler actually needs is, per account: the package that is about to be wasted
- * (soonest deadline that still holds a balance) and how much is at stake — so traffic
- * can be spread across accounts in proportion to that stake.
+ * Each selection compares the earliest non-empty, unexpired package per account.
+ * After it is consumed, the next package determines that account's deadline, so
+ * other accounts' urgent packages can run before this account's later packages.
  *
  * This module turns the heterogeneous provider quota shapes into that common package
  * list and derives the comparable aggregate the scorer consumes.
  */
-
-/** Guard against pathological quota maps blowing up the scored detail payload. */
-const MAX_PACKAGES = 40;
 
 function toNumber(value) {
   const n = Number(value);
@@ -98,7 +93,6 @@ export function packagesFromQuotas(quotas) {
   for (const [name, row] of chosen) {
     const pkg = rowToPackage(name, row);
     if (pkg) packages.push(pkg);
-    if (packages.length >= MAX_PACKAGES) break;
   }
   return packages;
 }

@@ -1566,7 +1566,7 @@ export default function ProfilePage() {
                 {[
                   { value: "fill-first", label: "Fill First", desc: "Use highest-priority account first" },
                   { value: "round-robin", label: "Round Robin", desc: "Rotate across accounts" },
-                  { value: "quota-weighted", label: "Quota Weighted", desc: "Spread traffic so every account's soon-expiring quota is burned in time" },
+                  { value: "quota-weighted", label: "Quota Weighted", desc: "Prioritize expiring packages, with weighted sharing for equal deadlines" },
                 ].map((opt) => (
                   <button
                     key={opt.value}
@@ -1594,8 +1594,10 @@ export default function ProfilePage() {
                   <div className="flex-1 min-w-0">
                     <p className="font-medium text-sm sm:text-base">Prefer Earlier Expiry</p>
                     <p className="text-xs sm:text-sm text-text-muted">
-                      Favour accounts whose own allowance needs burning fastest, so a package
-                      expiring soon is used before an equivalent balance that expires later
+                      Always choose the account with the earliest unexpired package that still
+                      has quota, based on the latest snapshot. After it is used up, compare all
+                      accounts again. Weights and session affinity cannot override an earlier
+                      deadline; unavailable or capacity-limited accounts may be skipped.
                     </p>
                   </div>
                   <Toggle
@@ -1640,10 +1642,9 @@ export default function ProfilePage() {
                   <div className="flex-1 min-w-0">
                     <p className="font-medium text-sm sm:text-base">Fair Share Weight</p>
                     <p className="text-xs sm:text-sm text-text-muted">
-                      How strongly traffic is spread across accounts in proportion to the quota
-                      each one is about to lose. Higher values stop a single account being drained
-                      to zero while other accounts&apos; packages expire unused. 0 = pure score
-                      ordering with no spreading.
+                      Spread traffic by at-risk quota. With Prefer Earlier Expiry enabled,
+                      this only breaks ties between accounts with the same earliest deadline.
+                      0 disables fair sharing, but does not disable earliest-expiry ordering.
                     </p>
                   </div>
                   <Input
@@ -1682,7 +1683,8 @@ export default function ProfilePage() {
               <div className="flex-1 min-w-0">
                 <p className="font-medium text-sm sm:text-base">Session Affinity</p>
                 <p className="text-xs sm:text-sm text-text-muted">
-                  Pin a conversation to one account to keep prompt cache warm
+                  Keep a conversation on one account for prompt caching. When Prefer Earlier
+                  Expiry is enabled in Quota Weighted mode, a known earlier package takes priority.
                 </p>
               </div>
               <Toggle

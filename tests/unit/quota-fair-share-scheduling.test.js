@@ -183,6 +183,106 @@ function simulate(accounts, count, opts = {}) {
   return picks;
 }
 
+describe("quota-weighted earliest-package ordering", () => {
+  beforeEach(() => resetOptimistic());
+
+  it("re-ranks after an early package is consumed instead of draining the account", () => {
+    const now = Date.now();
+    const accounts = [
+      { id: "a", quota: accountQuota([
+        { name: "a-first", remaining: 1, resetAtMs: now + DAY },
+        { name: "a-later", remaining: 10000, resetAtMs: now + 15 * DAY },
+      ]) },
+      { id: "b", quota: accountQuota([{ name: "b-first", remaining: 100, resetAtMs: now + 2 * DAY }]) },
+    ];
+    const rank = () => scoreAccounts(accounts, { getQuota: (c) => c.quota, now: () => now });
+    expect(rank()[0].connection.id).toBe("a");
+    accounts[0].quota.packages[0].remaining = 0;
+    recordConsumption("a");
+    expect(rank()[0].connection.id).toBe("b");
+    expect(rank().find((r) => r.connection.id === "a").detail.activePackage).toBe("a-later");
+  });
+
+  it("does not let weights, past service or load override even a one-millisecond earlier deadline", () => {
+    const now = Date.now();
+    const accounts = [
+      { id: "later", quota: accountQuota([{ remaining: 1000000, resetAtMs: now + DAY + 1 }]) },
+      { id: "earlier", quota: accountQuota([{ remaining: 0.01, resetAtMs: now + DAY }]) },
+    ];
+    recordConsumption("earlier", 10000);
+    const ranked = scoreAccounts(accounts, {
+      getQuota: (c) => c.quota,
+      weightRemaining: 10,
+      weightExpiry: 0,
+      weightFairShare: 10,
+      getLoad: (id) => id === "earlier" ? 10 : 0,
+    });
+    expect(ranked[0].connection.id).toBe("earlier");
+  });
+
+  it("ranks by weighted score when earliest-expiry preference is disabled", () => {
+    const now = Date.now();
+    const accounts = [
+      { id: "later", quota: accountQuota([{ remaining: 10000, resetAtMs: now + 15 * DAY }]) },
+      { id: "earlier", quota: accountQuota([{ remaining: 1, resetAtMs: now + DAY }]) },
+    ];
+    const ranked = scoreAccounts(accounts, {
+      getQuota: (c) => c.quota, preferEarlierExpiry: false, weightFairShare: 0,
+    });
+    expect(ranked[0].connection.id).toBe("later");
+  });
+
+  it("ignores empty, expired and undated packages when comparing deadlines", () => {
+    const now = Date.now();
+    const accounts = [
+      { id: "stale", quota: accountQuota([
+        { name: "expired", remaining: 1000000, resetAtMs: now - 1 },
+        { name: "empty", remaining: 0, resetAtMs: now + HOUR },
+        { name: "undated", remaining: 1000000, resetAtMs: NaN },
+        { name: "later", remaining: 1000000, resetAtMs: now + 15 * DAY },
+      ]) },
+      { id: "live", quota: accountQuota([{ remaining: 1, resetAtMs: now + DAY }]) },
+      { id: "unknown", quota: null },
+    ];
+    const ranked = scoreAccounts(accounts, { getQuota: (c) => c.quota, now: () => now });
+    expect(ranked.map((r) => r.connection.id)).toEqual(["live", "stale", "unknown"]);
+    expect(ranked[1].detail.activePackage).toBe("later");
+  });
+
+  it("does not truncate a soon-expiring package after the first forty rows", () => {
+    const now = Date.now();
+    const rows = Object.fromEntries(Array.from({ length: 45 }, (_, i) => [
+      `pack-${i}`, { remaining: 100, resetAt: new Date(now + (i === 44 ? 1 : 15) * DAY).toISOString() },
+    ]));
+    const packages = packagesFromQuotas(rows);
+    expect(packages).toHaveLength(45);
+    expect(pickActivePackage(aggregatePackages(packages), now).name).toBe("pack-44");
+  });
+
+  it("consumes 200 accounts x 30 packages in global deadline order", () => {
+    const now = Date.now();
+    const accounts = Array.from({ length: 200 }, (_, accountIndex) => ({
+      id: `account-${accountIndex}`,
+      quota: accountQuota(Array.from({ length: 30 }, (_, packageIndex) => ({
+        name: `pack-${packageIndex}`,
+        remaining: 1,
+        resetAtMs: now + (packageIndex + 1) * DAY + accountIndex,
+      }))),
+    }));
+    let previousDeadline = 0;
+    for (let i = 0; i < 6000; i += 1) {
+      const [best] = scoreAccounts(accounts, { getQuota: (c) => c.quota, now: () => now });
+      const active = pickActivePackage(best.connection.quota, now);
+      expect(active.resetAtMs).toBeGreaterThanOrEqual(previousDeadline);
+      expect(active.name).toBe(`pack-${Math.floor(i / 200)}`);
+      previousDeadline = active.resetAtMs;
+      active.remaining = 0;
+      recordConsumption(best.connection.id);
+    }
+    expect(accounts.every((c) => c.quota.packages.every((p) => p.remaining === 0))).toBe(true);
+  }, 30000);
+});
+
 describe("quota-weighted spreading", () => {
   beforeEach(() => {
     resetOptimistic();
@@ -222,11 +322,8 @@ describe("quota-weighted spreading", () => {
     ];
 
     const picks = simulate(accounts, 40);
-    // Sharing by raw balance would hand "urgent" ~3% of traffic and let its whole
-    // allowance expire. Sharing by required burn rate (300/day vs 9000/60d = 150/day)
-    // makes it the majority recipient instead, so a 30% floor is the regression guard.
-    expect(picks.get("urgent")).toBeGreaterThanOrEqual(12);
-    expect(picks.get("big")).toBeGreaterThan(0);
+    expect(picks.get("urgent")).toBe(40);
+    expect(picks.get("big")).toBe(0);
   });
 
   it("prefers accounts whose allowance is expiring over accounts with none", () => {
@@ -275,12 +372,9 @@ describe("quota-weighted spreading", () => {
       { id: "tiny", quota: accountQuota([{ name: "Bonus Pack 1", remaining: 5, resetAtMs: now + HOUR, recurring: false }]) },
     ];
 
-    // `huge` has 200000x the balance, so a balance-proportional split would round `tiny`
-    // down to nothing and waste its entire allowance. Sharing by burn rate gives it a
-    // few percent — enough to consume 5 units — and it bows out once exhausted.
     const picks = simulate(accounts, 50);
-    expect(picks.get("tiny")).toBeGreaterThanOrEqual(1);
-    expect(picks.get("huge")).toBeGreaterThan(0);
+    expect(picks.get("tiny")).toBe(50);
+    expect(picks.get("huge")).toBe(0);
   });
 
   it("keeps the fair-share bonus meaningful when every base score is identical", () => {
@@ -313,8 +407,9 @@ describe("quota-weighted spreading", () => {
 
     const ranked = scoreAccounts(accounts, { getQuota: (q) => q.quota });
     expect(ranked).toHaveLength(3);
-    const scores = ranked.map((r) => r.score);
-    expect(scores).toEqual([...scores].sort((x, y) => y - x));
+    expect(ranked.map((r) => r.connection.id)).toEqual(["a", "b", "c"]);
+    expect(ranked[0].score).toBeGreaterThanOrEqual(ranked[1].score);
+    expect(ranked[2].detail.activeResetAtMs).toBeNull();
   });
 
   it("still lets in-flight load break a tie between equally urgent accounts", () => {

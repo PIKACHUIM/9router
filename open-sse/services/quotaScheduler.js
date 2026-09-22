@@ -15,35 +15,12 @@
  * MIN-MAX NORMALISED across the CURRENT candidate set into [0,1], and only then
  * weighted. This keeps the two weights meaningful regardless of scale.
  *
- * ---------------------------------------------------------------------------
- * "Burn every account's soon-expiring package", not "burn the account that
- * expires first"
- * ---------------------------------------------------------------------------
- * Scoring on the ABSOLUTE deadline is the wrong objective when a pool has many
- * accounts. Every request goes to whichever account happens to expire first, so that
- * one account is drained to zero while every other account's packages quietly age out.
- *
- * The objective is instead: each account should get rid of its own allowance before
- * that allowance is wasted, spread across accounts. Two mechanisms deliver that:
- *
- *  1. URGENCY IS RELATIVE TO THE ACCOUNT'S OWN DEADLINE.
- *     `urgency = atRisk / msUntilDeadline` — the burn rate a package needs to be
- *     consumed before it is lost. A large balance expiring late and a small balance
- *     expiring at once can have the same urgency; the score no longer rewards the
- *     earliest calendar date.
- *
- *  2. WEIGHTED FAIR SHARE (deficit accounting).
- *     Min-max scoring always has exactly one winner, so consecutive selections keep
- *     landing on the same account. Each account's "share" is its required burn rate
- *     relative to the pool's, `urgency_i / Σ urgency`; we track how much it has recently
- *     been served and give the next request to whoever is furthest BEHIND its share.
- *
- *     Sharing by burn rate rather than by raw balance is what minimises waste: if every
- *     account is served at the rate it needs to finish before its own deadline, they all
- *     drain in step and no allowance is left over. Sharing by balance alone would keep a
- *     small-but-imminent package starved behind a large distant one (1000 points expiring
- *     tomorrow is worth a thousand times more attention per point than 100000 expiring
- *     in a year), which is exactly the "other packages expire first" failure again.
+ * With preferEarlierExpiry enabled, the earliest non-empty, unexpired package is
+ * the PRIMARY sort key across accounts. Once that package is exhausted, the account
+ * competes using its next package's deadline, not its original earliest deadline.
+ * Remaining quota, load and weighted fair share only break equal-deadline ties;
+ * a large balance or a service deficit must never promote a later deadline.
+ * Without this option, the weighted score remains the primary ordering.
  *
  * score = base + reach * norm(deficit)
  *   base    = wRemaining * norm(remaining)
@@ -58,15 +35,14 @@
  * exceed the spread: at exactly the spread, the account that has fallen behind can only
  * tie, and a tie is resolved by candidate order, so the same account keeps winning.
  * `+1` makes the term decisive while the weight still dials how much base differences
- * (balance, deadline urgency, load) bend the split. Set the weight to 0 for pure score
- * ordering with no spreading.
+ * (balance, deadline urgency, load) bend the split. Setting the weight to 0 disables
+ * spreading without removing the primary deadline ordering.
  *
  * Callers must pass a `getQuota(connection)` accessor returning either
  * `{ remaining, total, resetAtMs, packages? }` or the legacy `{ remaining, total,
  * resetAtMs }` — `normalizeQuota()` accepts both (see quotaPackages.js). Accounts with
- * no quota data score NEUTRAL so they are neither starved nor unfairly preferred; when
- * NO candidate has anything at risk the scorer falls back to the legacy absolute-deadline
- * behaviour, so installs that never report per-package data are unaffected.
+ * no known active deadline follow expiring balances in earlier-first mode. If NO
+ * candidate has anything at risk, ordering falls back to the weighted score.
  */
 
 import { normalizeQuota, pickActivePackage } from "./quotaPackages.js";
@@ -278,6 +254,7 @@ export function scoreAccounts(candidates, opts = {}) {
         // in it. Surfaced for logs/diagnostics and for tests to assert spreading.
         packageCount: q?.packages?.length ?? 0,
         activePackage: active?.name ?? null,
+        activeResetAtMs: active?.resetAtMs ?? null,
         atRisk: Number.isFinite(atRiskValues[i]) ? atRiskValues[i] : null,
         msUntilDeadline: active ? active.resetAtMs - n : null,
         share: Number.isFinite(shares[i]) ? shares[i] : null,
@@ -287,7 +264,14 @@ export function scoreAccounts(candidates, opts = {}) {
     };
   });
 
-  scored.sort((a, b) => b.score - a.score);
+  scored.sort((a, b) => {
+    if (preferEarlierExpiry) {
+      const aDeadline = a.detail.activeResetAtMs ?? Infinity;
+      const bDeadline = b.detail.activeResetAtMs ?? Infinity;
+      if (aDeadline !== bDeadline) return aDeadline < bDeadline ? -1 : 1;
+    }
+    return b.score - a.score;
+  });
   return scored;
 }
 
