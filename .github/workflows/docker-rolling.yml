@@ -1,0 +1,119 @@
+name: Build and Push Rolling Image
+
+# 本仓库（fork）专属的滚动构建：master 一旦变化就构建并发布 `latest`。
+#
+# 为什么不复用 docker-publish.yml：那个工作流是上游的发布流水线，只认 `v*` tag，
+# 并且会校验 tag 与 package.json 版本一致。上游的 tag 指向的是上游自己的提交，
+# 里面不含本 fork 的改动，所以它构建不出本 fork 的镜像。两者职责分开：
+#   - docker-publish.yml  上游发布流程（在本 fork 上处于休眠状态）
+#   - docker-rolling.yml  本 fork 的 master 滚动镜像（compose 拉取的就是它）
+on:
+  push:
+    branches:
+      - master
+    # GitHub 的 paths 过滤只作用于分支推送，不会限制 tag 推送。
+    paths:
+      - "src/**"
+      - "open-sse/**"
+      - "public/**"
+      - "custom-server.js"
+      - "package*.json"
+      - "next.config.*"
+      - "Dockerfile"
+      - ".github/workflows/docker-rolling.yml"
+  workflow_dispatch:
+
+# master 再次推送后，正在跑的旧构建已经没有意义。
+concurrency:
+  group: docker-rolling-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 镜像名来源优先级：
+      #   1) Repository Variables 里的 GHCR_IMAGE / DOCKERHUB_IMAGE
+      #   2) 未配置则回退到自动计算（GHCR 用当前仓库名，Docker Hub 用 secrets.DOCKERHUB_USERNAME）
+      # Docker/OCI 要求仓库名全小写，所有回退值统一做小写处理。
+      - name: Resolve image names
+        id: img
+        env:
+          VAR_GHCR_IMAGE: ${{ vars.GHCR_IMAGE }}
+          VAR_DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          set -euo pipefail
+
+          repo_lower="${GITHUB_REPOSITORY,,}"
+
+          ghcr_image="${VAR_GHCR_IMAGE:-ghcr.io/${repo_lower}}"
+          if [ -n "${DOCKERHUB_USERNAME:-}" ]; then
+            dockerhub_image="${VAR_DOCKERHUB_IMAGE:-docker.io/${DOCKERHUB_USERNAME}/9router}"
+          else
+            dockerhub_image="${VAR_DOCKERHUB_IMAGE:-}"
+          fi
+
+          echo "GHCR_IMAGE=${ghcr_image,,}" >> "$GITHUB_OUTPUT"
+          echo "DOCKERHUB_IMAGE=${dockerhub_image,,}" >> "$GITHUB_OUTPUT"
+
+          echo "Resolved GHCR_IMAGE=${ghcr_image,,}"
+          echo "Resolved DOCKERHUB_IMAGE=${dockerhub_image,,}"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: ${{ steps.img.outputs.DOCKERHUB_IMAGE != '' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ steps.img.outputs.GHCR_IMAGE }}
+            ${{ steps.img.outputs.DOCKERHUB_IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ steps.img.outputs.GHCR_IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ steps.img.outputs.GHCR_IMAGE }}:buildcache,mode=max
+          platforms: linux/amd64,linux/arm64
+          provenance: false
+          sbom: false
+
+      - name: Report published image
+        env:
+          GHCR_IMAGE: ${{ steps.img.outputs.GHCR_IMAGE }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Rolling image published"
+            echo "- \`${GHCR_IMAGE}:latest\`"
+            echo "- commit \`${GITHUB_SHA}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          docker buildx imagetools inspect "${GHCR_IMAGE}:latest" | tee "$RUNNER_TEMP/ghcr-latest.txt"

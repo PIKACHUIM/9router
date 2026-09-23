@@ -1,0 +1,92 @@
+name: Sync upstream
+
+# 定时把 decolua/9router 的 master 合并进本 fork 的 master，使 package.json 里的
+# 版本号（即页面侧边栏显示的 vX.Y.Z）跟着上游发版走。
+#
+# 两个关键点：
+#   1) 只 fetch upstream 的 master，不带 tag。上游的 docker-publish.yml 是 tag 驱动的，
+#      如果把这些 tag 推到本 fork，它会去构建「上游提交」并抢占 latest，把本 fork 的镜像覆盖掉。
+#   2) 这里的 push 用的是内置 GITHUB_TOKEN，GitHub 不会让 GITHUB_TOKEN 产生的 push 再触发
+#      其他工作流，所以合并成功后显式 dispatch 一次 docker-rolling.yml
+#      （workflow_dispatch 是该限制的例外，因此可以生效）。
+on:
+  schedule:
+    # 每 6 小时一次（UTC）。上游发版节奏较快，需要更勤就把小时步长调小。
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+# 同一时间只允许一个同步任务，避免两次 cron 互相抢分支。
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out fork master
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote and fetch master (no tags)
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/decolua/9router.git
+          git fetch --no-tags upstream master
+          echo "fork/master     $(git rev-parse --short HEAD)"
+          echo "upstream/master $(git rev-parse --short upstream/master)"
+
+      - name: Merge upstream/master when it moved ahead
+        id: merge
+        run: |
+          set -euo pipefail
+
+          if git merge-base --is-ancestor upstream/master HEAD; then
+            echo "Already up to date with upstream/master."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "upstream/master is ahead, merging."
+          if git merge --no-edit upstream/master; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=conflict" >> "$GITHUB_OUTPUT"
+            git merge --abort
+          fi
+
+      - name: Show resulting version
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          node -p "'package.json version = ' + require('./package.json').version"
+
+      - name: Push merged master
+        if: steps.merge.outputs.changed == 'true'
+        run: git push origin HEAD:master
+
+      # GITHUB_TOKEN 的 push 不会触发 docker-rolling.yml 的 push 事件，这里手动触发一次。
+      - name: Trigger the rolling image build
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run docker-rolling.yml --ref master
+
+      - name: Fail loudly on a merge conflict
+        if: steps.merge.outputs.changed == 'conflict'
+        run: |
+          echo "::error title=Upstream sync conflict::Merging upstream/master produced conflicts and was aborted. Resolve it locally, then re-run this workflow."
+          exit 1
