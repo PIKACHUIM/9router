@@ -1531,5 +1531,7 @@
   "CodeBuddy client": "CodeBuddy 客户端",
   "WorkBuddy client": "WorkBuddy 客户端",
   "Off (leave headers unchanged)": "关闭（不修改请求头）",
-  "Sends the official client's User-Agent and marker headers upstream. Gateways that only accept CodeBuddy / WorkBuddy clients need this.": "向上游发送官方客户端的 User-Agent 与标记请求头；仅接受 CodeBuddy / WorkBuddy 官方客户端的网关需要开启。"
+  "Sends the official client's User-Agent and marker headers upstream. Gateways that only accept CodeBuddy / WorkBuddy clients need this.": "向上游发送官方客户端的 User-Agent 与标记请求头；仅接受 CodeBuddy / WorkBuddy 官方客户端的网关需要开启。",
+  "Client User-Agent": "客户端 User-Agent",
+  "Sent upstream verbatim. Leave empty to use the default WorkBuddy UA.": "原样发送到上游；留空则使用默认的 WorkBuddy UA。"
 }

@@ -141,6 +141,7 @@ export async function POST(request) {
         baseUrl: node.baseUrl,
         nodeName: node.name,
         clientProfile: node.clientProfile || "auto",
+        clientUserAgent: node.clientUserAgent || "",
       };
     } else if (isAnthropicCompatibleProvider(provider)) {
       const node = await getProviderNodeById(provider);
@@ -152,6 +153,7 @@ export async function POST(request) {
         baseUrl: node.baseUrl,
         nodeName: node.name,
         clientProfile: node.clientProfile || "auto",
+        clientUserAgent: node.clientUserAgent || "",
       };
     } else if (isCustomEmbeddingProvider(provider)) {
       const node = await getProviderNodeById(provider);

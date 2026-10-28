@@ -1,12 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
   CODEBUDDY_CLIENT_UA,
+  DEFAULT_CLIENT_UA,
   WORKBUDDY_CLIENT_UA,
   CLIENT_PROFILES,
   applyClientProfile,
   clientProfileHeaders,
+  markersForUserAgent,
   normalizeClientProfile,
+  resolveClientIdentity,
   resolveClientProfile,
+  sanitizeClientUserAgent,
 } from "../../open-sse/providers/clientProfiles.js";
 import { DefaultExecutor } from "../../open-sse/executors/default.js";
 import { PROVIDERS } from "../../open-sse/config/providers.js";
@@ -17,6 +21,12 @@ describe("client identity profiles", () => {
     expect(WORKBUDDY_CLIENT_UA).toBe("WorkBuddy/5.9.2 WorkBuddy/5.9.2 CLI/2.165.0");
     expect(CLIENT_PROFILES.codebuddy.userAgent).toBe(CODEBUDDY_CLIENT_UA);
     expect(CLIENT_PROFILES.workbuddy.userAgent).toBe(WORKBUDDY_CLIENT_UA);
+  });
+
+  it("defaults the conversion UA to WorkBuddy", () => {
+    expect(DEFAULT_CLIENT_UA).toBe(WORKBUDDY_CLIENT_UA);
+    expect(resolveClientIdentity({ provider: "codebuddy-cn", credentials: { providerSpecificData: {} } }))
+      .toMatchObject({ userAgent: WORKBUDDY_CLIENT_UA, headers: CLIENT_PROFILES.workbuddy.headers });
   });
 
   it("ships the IDE markers for CodeBuddy and the CLI markers for WorkBuddy", () => {
@@ -50,9 +60,18 @@ describe("client identity profiles", () => {
 
   it("leaves non-CodeBuddy channels alone", () => {
     expect(resolveClientProfile({ provider: "openai", credentials: { providerSpecificData: {} } })).toBeNull();
-    expect(resolveClientProfile({
+    expect(resolveClientIdentity({ provider: "openai", credentials: { providerSpecificData: {} } })).toBeNull();
+    expect(resolveClientIdentity({
       provider: "openai-compatible-chat-abc",
       credentials: { providerSpecificData: { baseUrl: "https://api.example.com/v1", nodeName: "My Relay" } },
+    })).toBeNull();
+    expect(resolveClientIdentity({
+      provider: "openai-compatible-chat-abc",
+      credentials: { providerSpecificData: { nodeName: "My Relay", clientProfile: "none" } },
+    })).toBeNull();
+    expect(resolveClientIdentity({
+      provider: "openai-compatible-chat-abc",
+      credentials: { providerSpecificData: { nodeName: "My Relay", clientProfile: "auto" } },
     })).toBeNull();
   });
 
@@ -99,6 +118,49 @@ describe("client identity profiles", () => {
     })).toBeNull();
   });
 
+  it("uses the selected profile's own UA and markers when no UA is typed", () => {
+    const identity = resolveClientIdentity({
+      provider: "codebuddy-cn",
+      credentials: { providerSpecificData: { clientProfile: "codebuddy" } },
+    });
+    expect(identity).toMatchObject({ id: "codebuddy", userAgent: CODEBUDDY_CLIENT_UA });
+    expect(identity.headers["X-IDE-Type"]).toBe("IDE");
+  });
+
+  it("honors a configured UA and keeps markers consistent with it", () => {
+    const custom = "WorkBuddy/6.1.0 WorkBuddy/6.1.0 CLI/2.200.0";
+    const identity = resolveClientIdentity({
+      provider: "codebuddy-cn",
+      credentials: { providerSpecificData: { clientUserAgent: custom } },
+    });
+    expect(identity.userAgent).toBe(custom);
+    expect(identity.headers["X-IDE-Type"]).toBe("CLI");
+
+    const codebuddyUa = resolveClientIdentity({
+      provider: "openai-compatible-chat-abc",
+      credentials: {
+        providerSpecificData: { nodeName: "WorkBuddy", clientUserAgent: "CodeBuddyIDE/9.9.9 CodeBuddy/9.9.9" },
+      },
+    });
+    expect(codebuddyUa.userAgent).toBe("CodeBuddyIDE/9.9.9 CodeBuddy/9.9.9");
+    expect(codebuddyUa.headers["X-IDE-Type"]).toBe("IDE");
+
+    const unknown = resolveClientIdentity({
+      provider: "codebuddy-intl",
+      credentials: { providerSpecificData: { clientUserAgent: "MyAgent/1.0" } },
+    });
+    expect(unknown.userAgent).toBe("MyAgent/1.0");
+    // Unknown UA keeps the channel's own marker set instead of inventing one.
+    expect(unknown.headers).toBe(CLIENT_PROFILES.codebuddy.headers);
+  });
+
+  it("strips header-injection characters from a configured UA", () => {
+    expect(sanitizeClientUserAgent("  WorkBuddy/1.0 \r\nX-Injected: 1  ")).toBe("WorkBuddy/1.0 X-Injected: 1");
+    expect(sanitizeClientUserAgent(undefined)).toBe("");
+    expect(sanitizeClientUserAgent(42)).toBe("");
+    expect(sanitizeClientUserAgent("a".repeat(400))).toHaveLength(256);
+  });
+
   it("overwrites identity headers without touching auth or case variants", () => {
     const headers = {
       "Content-Type": "application/json",
@@ -117,6 +179,12 @@ describe("client identity profiles", () => {
     expect(applyClientProfile(headers, null)).toBe(headers);
   });
 
+  it("maps a UA family to the matching marker set", () => {
+    expect(markersForUserAgent(WORKBUDDY_CLIENT_UA)).toBe(CLIENT_PROFILES.workbuddy.headers);
+    expect(markersForUserAgent(CODEBUDDY_CLIENT_UA)).toBe(CLIENT_PROFILES.codebuddy.headers);
+    expect(markersForUserAgent("curl/8.0")).toBeNull();
+  });
+
   it("registry headers carry the shared identity block", () => {
     expect(clientProfileHeaders("codebuddy")["User-Agent"]).toBe(CODEBUDDY_CLIENT_UA);
     expect(clientProfileHeaders("unknown")).toEqual({});
@@ -126,13 +194,13 @@ describe("client identity profiles", () => {
 });
 
 describe("DefaultExecutor client conversion", () => {
-  it("stamps the CodeBuddy identity on built-in CodeBuddy channels", () => {
+  it("sends the default WorkBuddy identity on built-in CodeBuddy channels", () => {
     const headers = new DefaultExecutor("codebuddy-cn").buildHeaders(
       { apiKey: "sk-test", providerSpecificData: {} },
       true,
     );
-    expect(headers["User-Agent"]).toBe(CODEBUDDY_CLIENT_UA);
-    expect(headers["X-IDE-Type"]).toBe("IDE");
+    expect(headers["User-Agent"]).toBe(WORKBUDDY_CLIENT_UA);
+    expect(headers["X-IDE-Type"]).toBe("CLI");
     expect(headers["x-codebuddy-request"]).toBe("1");
     expect(headers.Authorization).toBe("Bearer sk-test");
     expect(headers.Accept).toBe("text/event-stream");
@@ -148,18 +216,25 @@ describe("DefaultExecutor client conversion", () => {
     expect(headers["X-Product"]).toBe("SaaS");
   });
 
-  it("honors an explicit selection and the off switch", () => {
+  it("honors an explicit profile, a configured UA and the off switch", () => {
     const forced = new DefaultExecutor("openai-compatible-chat-abc").buildHeaders(
       { apiKey: "sk-test", providerSpecificData: { nodeName: "Relay", clientProfile: "codebuddy" } },
       false,
     );
     expect(forced["User-Agent"]).toBe(CODEBUDDY_CLIENT_UA);
 
+    const configured = new DefaultExecutor("codebuddy-intl").buildHeaders(
+      { apiKey: "sk-test", providerSpecificData: { clientUserAgent: "WorkBuddy/7.0.0 WorkBuddy/7.0.0 CLI/2.300.0" } },
+      true,
+    );
+    expect(configured["User-Agent"]).toBe("WorkBuddy/7.0.0 WorkBuddy/7.0.0 CLI/2.300.0");
+    expect(configured["X-IDE-Type"]).toBe("CLI");
+
     const off = new DefaultExecutor("codebuddy-cn").buildHeaders(
       { apiKey: "sk-test", providerSpecificData: { clientProfile: "none" } },
       true,
     );
-    // Registry defaults still ship the CodeBuddy UA; `none` only stops the runtime override.
+    // Registry defaults still ship the channel's static UA; `none` only stops the runtime override.
     expect(off["User-Agent"]).toBe(CODEBUDDY_CLIENT_UA);
     expect(off.Authorization).toBe("Bearer sk-test");
   });

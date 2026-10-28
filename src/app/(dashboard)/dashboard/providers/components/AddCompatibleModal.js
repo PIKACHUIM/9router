@@ -3,7 +3,7 @@
 import { useState, useEffect } from "react";
 import PropTypes from "prop-types";
 import { Badge, Button, Input, Modal, Select } from "@/shared/components";
-import { CLIENT_PROFILE_UI_OPTIONS, normalizeClientProfile } from "open-sse/providers/clientProfiles.js";
+import { CLIENT_PROFILE_UI_OPTIONS, DEFAULT_CLIENT_UA, normalizeClientProfile, sanitizeClientUserAgent } from "open-sse/providers/clientProfiles.js";
 
 const VARIANT_CONFIG = {
   openai: {
@@ -43,6 +43,7 @@ function AddCompatibleModal({ variant, isOpen, onClose, onCreated }) {
     ...(config.hasApiType ? { apiType: "chat" } : {}),
     baseUrl: config.defaultBaseUrl,
     clientProfile: "auto",
+    clientUserAgent: DEFAULT_CLIENT_UA,
   });
 
   const [formData, setFormData] = useState(initialFormData);
@@ -77,6 +78,7 @@ function AddCompatibleModal({ variant, isOpen, onClose, onCreated }) {
           baseUrl: formData.baseUrl,
           type: config.type,
           clientProfile: normalizeClientProfile(formData.clientProfile),
+          clientUserAgent: sanitizeClientUserAgent(formData.clientUserAgent),
         }),
       });
       const data = await res.json();
@@ -174,6 +176,14 @@ function AddCompatibleModal({ variant, isOpen, onClose, onCreated }) {
           value={formData.clientProfile}
           onChange={(e) => setFormData({ ...formData, clientProfile: e.target.value })}
           hint="Sends the official client's User-Agent and marker headers upstream. Gateways that only accept CodeBuddy / WorkBuddy clients need this."
+        />
+        <Input
+          label="Client User-Agent"
+          value={formData.clientUserAgent}
+          onChange={(e) => setFormData({ ...formData, clientUserAgent: e.target.value })}
+          placeholder={DEFAULT_CLIENT_UA}
+          hint="Sent upstream verbatim. Leave empty to use the default WorkBuddy UA."
+          disabled={formData.clientProfile === "none"}
         />
         <Input
           label="API Key (for Check)"

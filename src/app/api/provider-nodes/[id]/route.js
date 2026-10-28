@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { deleteProviderConnectionsByProvider, deleteProviderNode, getProviderConnections, getProviderNodeById, updateProviderConnection, updateProviderNode } from "@/models";
-import { normalizeClientProfile } from "open-sse/providers/clientProfiles.js";
+import { normalizeClientProfile, sanitizeClientUserAgent } from "open-sse/providers/clientProfiles.js";
 
 // PUT /api/provider-nodes/[id] - Update provider node
 export async function PUT(request, { params }) {
@@ -60,6 +60,9 @@ export async function PUT(request, { params }) {
     if (Object.prototype.hasOwnProperty.call(body, "clientProfile")) {
       updates.clientProfile = normalizeClientProfile(body.clientProfile);
     }
+    if (Object.prototype.hasOwnProperty.call(body, "clientUserAgent")) {
+      updates.clientUserAgent = sanitizeClientUserAgent(body.clientUserAgent);
+    }
 
     if (node.type === "openai-compatible") {
       updates.apiType = apiType;
@@ -77,6 +80,7 @@ export async function PUT(request, { params }) {
           baseUrl: sanitizedBaseUrl,
           nodeName: updated.name,
           clientProfile: updated.clientProfile || "auto",
+          clientUserAgent: updated.clientUserAgent || "",
         }
       })
     )));

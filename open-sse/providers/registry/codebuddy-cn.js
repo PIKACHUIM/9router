@@ -27,9 +27,9 @@ export default {
     // MiniMax, DeepSeek, Hunyuan) takes reasoning via OpenAI-style reasoning_effort,
     // not its vendor-native thinking shape. Force the openai thinking format.
     thinkingFormat: "openai",
-    // Client identity is the official CodeBuddy IDE client: the gateway (and the
-    // relays in front of it) gate on both the UA and the X-IDE-* markers.
-    // Single source: providers/clientProfiles.js.
+    // Static channel identity (also used by quota/billing calls). Chat requests
+    // are stamped at dispatch time with the configured client UA, whose default is
+    // the WorkBuddy client — see providers/clientProfiles.js.
     headers: clientProfileHeaders("codebuddy"),
     auth: {
       combined: true,

@@ -3,7 +3,7 @@
 import { useState, useEffect } from "react";
 import PropTypes from "prop-types";
 import { Button, Badge, Input, Modal, Select } from "@/shared/components";
-import { CLIENT_PROFILE_UI_OPTIONS, normalizeClientProfile } from "open-sse/providers/clientProfiles.js";
+import { CLIENT_PROFILE_UI_OPTIONS, DEFAULT_CLIENT_UA, normalizeClientProfile, sanitizeClientUserAgent } from "open-sse/providers/clientProfiles.js";
 
 export default function EditCompatibleNodeModal({ isOpen, node, onSave, onClose, isAnthropic }) {
   const [formData, setFormData] = useState({
@@ -12,6 +12,7 @@ export default function EditCompatibleNodeModal({ isOpen, node, onSave, onClose,
     apiType: "chat",
     baseUrl: "https://api.openai.com/v1",
     clientProfile: "auto",
+    clientUserAgent: DEFAULT_CLIENT_UA,
   });
   const [saving, setSaving] = useState(false);
   const [checkKey, setCheckKey] = useState("");
@@ -27,6 +28,7 @@ export default function EditCompatibleNodeModal({ isOpen, node, onSave, onClose,
         apiType: node.apiType || "chat",
         baseUrl: node.baseUrl || (isAnthropic ? "https://api.anthropic.com/v1" : "https://api.openai.com/v1"),
         clientProfile: normalizeClientProfile(node.clientProfile),
+        clientUserAgent: node.clientUserAgent || DEFAULT_CLIENT_UA,
       });
     }
   }, [node, isAnthropic]);
@@ -45,6 +47,7 @@ export default function EditCompatibleNodeModal({ isOpen, node, onSave, onClose,
         prefix: formData.prefix,
         baseUrl: formData.baseUrl,
         clientProfile: normalizeClientProfile(formData.clientProfile),
+        clientUserAgent: sanitizeClientUserAgent(formData.clientUserAgent),
       };
       if (!isAnthropic) {
         payload.apiType = formData.apiType;
@@ -118,6 +121,14 @@ export default function EditCompatibleNodeModal({ isOpen, node, onSave, onClose,
           onChange={(e) => setFormData({ ...formData, clientProfile: e.target.value })}
           hint="Sends the official client's User-Agent and marker headers upstream. Gateways that only accept CodeBuddy / WorkBuddy clients need this."
         />
+        <Input
+          label="Client User-Agent"
+          value={formData.clientUserAgent}
+          onChange={(e) => setFormData({ ...formData, clientUserAgent: e.target.value })}
+          placeholder={DEFAULT_CLIENT_UA}
+          hint="Sent upstream verbatim. Leave empty to use the default WorkBuddy UA."
+          disabled={formData.clientProfile === "none"}
+        />
         <div className="flex gap-2">
           <Input
             label="API Key (for Check)"
@@ -166,6 +177,7 @@ EditCompatibleNodeModal.propTypes = {
     apiType: PropTypes.string,
     baseUrl: PropTypes.string,
     clientProfile: PropTypes.string,
+    clientUserAgent: PropTypes.string,
   }),
   onSave: PropTypes.func.isRequired,
   onClose: PropTypes.func.isRequired,

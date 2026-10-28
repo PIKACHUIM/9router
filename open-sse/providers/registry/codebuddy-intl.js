@@ -27,8 +27,9 @@ export default {
     forceStream: true,
     // CodeBuddy intl speaks the same unified OpenAI reasoning_effort shape as CN.
     thinkingFormat: "openai",
-    // Official CodeBuddy IDE client identity (UA + X-IDE-* markers).
-    // Single source: providers/clientProfiles.js.
+    // Static channel identity (also used by quota/billing calls). Chat requests
+    // are stamped at dispatch time with the configured client UA, whose default is
+    // the WorkBuddy client — see providers/clientProfiles.js.
     headers: clientProfileHeaders("codebuddy"),
     auth: {
       combined: true,

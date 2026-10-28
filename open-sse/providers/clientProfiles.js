@@ -45,6 +45,10 @@ export const CLIENT_PROFILES = {
   },
 };
 
+// Identity a conversion-enabled channel presents when the user has not chosen a
+// profile or typed a UA. Product decision: default to the WorkBuddy client.
+export const DEFAULT_CLIENT_UA = WORKBUDDY_CLIENT_UA;
+
 // Selectable values. `auto` = detect from the channel (built-in provider, node
 // name/prefix or baseUrl host); `none` = leave the request headers untouched.
 export const CLIENT_PROFILE_CHOICES = ["auto", "codebuddy", "workbuddy", "none"];
@@ -83,18 +87,14 @@ function hostOf(url) {
 const CODEBUDDY_HOST_PATTERN = /(^|\.)(codebuddy\.(ai|cn|com)|copilot\.tencent\.com)$/;
 
 /**
- * Resolve the client identity a channel must present upstream.
+ * Detect which client family a channel belongs to.
  *
- * Order matters: an explicit selection always wins, then the provider id, then
- * the node/connection labels (relays are usually named after the channel they
- * resell), and finally the baseUrl host. Returns null when the channel is not a
- * CodeBuddy family channel or conversion was explicitly disabled.
+ * Order matters: provider id, then node/connection labels (relays are usually
+ * named after the channel they resell), then the baseUrl host. Returns null when
+ * the channel is not a CodeBuddy family channel.
  */
-export function resolveClientProfile({ provider, credentials } = {}) {
+export function detectProfile(provider, credentials) {
   const data = credentials?.providerSpecificData || {};
-  const configured = normalizeClientProfile(data.clientProfile);
-  if (configured === "none") return null;
-  if (configured !== "auto") return CLIENT_PROFILES[configured] || null;
 
   const providerId = String(provider || "").toLowerCase();
   if (providerId.includes("workbuddy")) return CLIENT_PROFILES.workbuddy;
@@ -117,17 +117,33 @@ export function resolveClientProfile({ provider, credentials } = {}) {
 }
 
 /**
+ * Resolve the client profile (marker set) a channel should use, honoring an
+ * explicit selection and the off switch. Kept separate from
+ * resolveClientIdentity() for callers that only need the family.
+ */
+export function resolveClientProfile({ provider, credentials } = {}) {
+  const configured = normalizeClientProfile(credentials?.providerSpecificData?.clientProfile);
+  if (configured === "none") return null;
+  if (configured !== "auto") return CLIENT_PROFILES[configured] || null;
+  return detectProfile(provider, credentials);
+}
+
+/**
  * Overwrite the identity headers in place. Any case variant of a marker header
  * is removed first, otherwise a node that declares its own `X-IDE-Type` would
  * end up sending two conflicting values.
+ *
+ * Accepts either a profile or the object returned by resolveClientIdentity().
  */
-export function applyClientProfile(headers, profile) {
-  if (!profile || !headers) return headers;
+export function applyClientProfile(headers, identity) {
+  if (!identity || !headers) return headers;
+  const userAgent = identity.userAgent || CLIENT_PROFILES[identity.id]?.userAgent;
+  const markers = identity.headers || CLIENT_PROFILES[identity.id]?.headers || {};
   for (const key of Object.keys(headers)) {
     if (IDENTITY_HEADERS.includes(key.toLowerCase())) delete headers[key];
   }
-  headers["User-Agent"] = profile.userAgent;
-  return Object.assign(headers, profile.headers);
+  if (userAgent) headers["User-Agent"] = userAgent;
+  return Object.assign(headers, markers);
 }
 
 /** Header block a registry entry should ship as its static defaults. */
@@ -135,4 +151,48 @@ export function clientProfileHeaders(profileId) {
   const profile = CLIENT_PROFILES[profileId];
   if (!profile) return {};
   return { "User-Agent": profile.userAgent, ...profile.headers };
+}
+
+/**
+ * A UA is attacker-adjacent input (it is written into an outbound header), so it
+ * must never carry CR/LF or be unbounded.
+ */
+export function sanitizeClientUserAgent(value) {
+  if (typeof value !== "string") return "";
+  return value.replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 256);
+}
+
+/** Marker set implied by a UA string, so custom UAs stay internally consistent. */
+export function markersForUserAgent(userAgent) {
+  const text = String(userAgent || "").toLowerCase();
+  if (text.includes("workbuddy")) return CLIENT_PROFILES.workbuddy.headers;
+  if (text.includes("codebuddy")) return CLIENT_PROFILES.codebuddy.headers;
+  return null;
+}
+
+/**
+ * Resolve the full outbound identity for a channel.
+ *
+ * UA precedence: per-connection/node override → selected profile → default
+ * (WorkBuddy). Marker headers follow the UA family so a custom UA never ships
+ * with markers from the other client; unknown UAs keep the profile's markers.
+ *
+ * Returns null for channels that are not CodeBuddy-family or where conversion
+ * was explicitly disabled.
+ */
+export function resolveClientIdentity({ provider, credentials } = {}) {
+  const data = credentials?.providerSpecificData || {};
+  const mode = normalizeClientProfile(data.clientProfile);
+  if (mode === "none") return null;
+
+  const profile = mode === "auto" ? detectProfile(provider, credentials) : CLIENT_PROFILES[mode];
+  if (!profile) return null;
+
+  const custom = sanitizeClientUserAgent(data.clientUserAgent);
+  const userAgent = custom || (mode === "auto" ? DEFAULT_CLIENT_UA : profile.userAgent);
+  return {
+    id: profile.id,
+    userAgent,
+    headers: markersForUserAgent(userAgent) || profile.headers,
+  };
 }

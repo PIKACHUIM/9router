@@ -64,6 +64,8 @@ export async function createProviderNode(data) {
     baseUrl: data.baseUrl,
     // Client identity the channel presents upstream: auto | codebuddy | workbuddy | none
     clientProfile: data.clientProfile || "auto",
+    // Optional User-Agent override; empty means the built-in default (WorkBuddy)
+    clientUserAgent: data.clientUserAgent || "",
     createdAt: now,
     updatedAt: now,
   };
