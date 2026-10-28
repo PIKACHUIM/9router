@@ -17,6 +17,8 @@ vi.mock("../../open-sse/utils/requestLogger.js", () => ({
     logClientRawRequest: vi.fn(),
     logRawRequest: vi.fn(),
     logTargetRequest: vi.fn(),
+    logProviderResponse: vi.fn(),
+    logConvertedResponse: vi.fn(),
     logError: vi.fn(),
   })),
 }));
@@ -30,7 +32,13 @@ vi.mock("../../open-sse/utils/bypassHandler.js", () => ({
   handleBypassRequest: vi.fn(() => null),
 }));
 
+vi.mock("../../open-sse/utils/stream.js", () => ({
+  createSSETransformStreamWithLogger: vi.fn(() => new TransformStream()),
+  createPassthroughStreamWithLogger: vi.fn(() => new TransformStream()),
+}));
+
 vi.mock("../../open-sse/utils/streamHandler.js", () => ({
+  pipeWithDisconnect: vi.fn((response, transform) => response.body.pipeThrough(transform)),
   createStreamController: vi.fn(() => ({
     signal: undefined,
     handleComplete: vi.fn(),
@@ -91,6 +99,9 @@ vi.mock("../../open-sse/translator/concerns/prefetch.js", () => ({
 vi.mock("../../open-sse/handlers/chatCore/requestDetail.js", () => ({
   buildRequestDetail: vi.fn((detail) => detail),
   extractRequestConfig: vi.fn((body, stream) => ({ body, stream })),
+  extractUsageFromResponse: vi.fn((body) => body.usage || {}),
+  saveUsageStats: vi.fn(),
+  formatDoneLine: vi.fn(() => "done"),
 }));
 
 vi.mock("../../open-sse/utils/error.js", () => ({
@@ -155,5 +166,104 @@ describe("forceStream provider config", { timeout: 20_000 }, () => {
 
     expect(executeMock).toHaveBeenCalledTimes(1);
     expect(executeMock.mock.calls[0][0].stream).toBe(true);
+    expect(executeMock.mock.calls[0][0].body.stream).toBe(true);
+  });
+
+  it.each([false, true])("keeps the actual same-format upstream body consistent with stream=%s", async (stream) => {
+    const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
+    const options = makeOptions(stream);
+    options.modelInfo.provider = "openrouter";
+    options.body.stream_options = { include_usage: true };
+    await handleChatCore(options);
+    const sent = executeMock.mock.calls[0][0];
+    expect(sent.stream).toBe(stream);
+    expect(sent.body.stream).toBe(stream);
+    if (!stream) expect(sent.body).not.toHaveProperty("stream_options");
+  });
+
+  it("also applies the stream setting to native passthrough bodies", async () => {
+    const { isNativePassthrough } = await import("../../open-sse/utils/clientDetector.js");
+    const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
+    isNativePassthrough.mockReturnValue(true);
+    try {
+      await handleChatCore(makeOptions(false));
+      expect(executeMock.mock.calls[0][0].body.stream).toBe(true);
+    } finally {
+      isNativePassthrough.mockReturnValue(false);
+    }
+  });
+
+  it("returns JSON when a streaming-only provider answers a synchronous client with JSON", async () => {
+    const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
+    executeMock.mockResolvedValueOnce({
+      response: Response.json({ id: "chatcmpl-json", object: "chat.completion", model: "gpt-4.1",
+        choices: [{ index: 0, message: { role: "assistant", content: "hello" }, finish_reason: "stop" }] }),
+      url: "https://api.openai.com/v1/chat/completions", headers: {},
+    });
+    const result = await handleChatCore(makeOptions(false));
+    expect(result.success).toBe(true);
+    expect(result.response.headers.get("content-type")).toContain("application/json");
+    expect((await result.response.json()).choices[0].message.content).toBe("hello");
+  });
+
+  it("synthesizes SSE when a streaming request receives complete upstream JSON", async () => {
+    const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
+    executeMock.mockResolvedValueOnce({
+      response: Response.json({ id: "chatcmpl-json", object: "chat.completion", model: "gpt-4.1",
+        choices: [{ index: 0, message: { role: "assistant", content: "hello" }, finish_reason: "stop" }] }),
+      url: "https://api.openai.com/v1/chat/completions", headers: {},
+    });
+    const result = await handleChatCore(makeOptions(true));
+    expect(result.success).toBe(true);
+    expect(result.response.headers.get("content-type")).toContain("text/event-stream");
+    const text = await result.response.text();
+    expect(text).toContain('"delta":{"role":"assistant","content":"hello"}');
+    expect(text).toContain("data: [DONE]");
+  });
+
+  it("aggregates a streaming-only provider without exposing SSE to a synchronous client", async () => {
+    const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
+    executeMock.mockResolvedValueOnce({
+      response: new Response('data: {"id":"chatcmpl-sse","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+        { headers: { "content-type": "text/event-stream" } }),
+      url: "https://api.openai.com/v1/chat/completions", headers: {},
+    });
+    const result = await handleChatCore(makeOptions(false));
+    expect(executeMock.mock.calls[0][0].body.stream).toBe(true);
+    expect(result.success).toBe(true);
+    expect((await result.response.json()).choices[0].message.content).toBe("hello");
+  });
+
+  it("converts complete Responses upstream JSON into a synchronous Chat completion", async () => {
+    await import("../translator/registerAll.js");
+    const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
+    const options = makeOptions(false);
+    options.modelInfo = { provider: "codex", model: "gpt-5.1-codex" };
+    executeMock.mockResolvedValueOnce({
+      response: Response.json({ id: "resp-test", object: "response", model: "gpt-5.1-codex", status: "completed", error: null,
+        output: [{ id: "msg-1", type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: "hello", annotations: [] }] }],
+        usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 } }),
+      url: "https://chatgpt.com/backend-api/codex/responses", headers: {},
+    });
+    const result = await handleChatCore(options);
+    expect(result.success).toBe(true);
+    const body = await result.response.json();
+    expect(body.object).toBe("chat.completion");
+    expect(body.choices[0].message.content).toBe("hello");
+    expect(body.usage.total_tokens).toBe(15);
+  });
+
+  it("does not call request-success callbacks for an upstream JSON error", async () => {
+    const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
+    const options = makeOptions(true);
+    options.onRequestSuccess = vi.fn();
+    executeMock.mockResolvedValueOnce({
+      response: Response.json({ error: { message: "quota exceeded", status: 429 } }),
+      url: "https://api.openai.com/v1/chat/completions", headers: {},
+    });
+    const result = await handleChatCore(options);
+    expect(result.success).toBe(false);
+    expect(result.status).toBe(429);
+    expect(options.onRequestSuccess).not.toHaveBeenCalled();
   });
 });

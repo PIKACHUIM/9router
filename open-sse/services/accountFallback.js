@@ -71,7 +71,7 @@ export function checkFallbackError(status, errorText, backoffLevel = 0, provider
   // lock the whole pool for the request's own fault. Short-circuit before the
   // ERROR_RULES scan (whose "capacity" rule otherwise matches "context limit").
   if (isRequestScopedError(status, lowerError)) {
-    return { shouldFallback: false, cooldownMs: 0 };
+    return { shouldFallback: false, cooldownMs: 0, requestScoped: true };
   }
 
   for (const rule of ERROR_RULES) {

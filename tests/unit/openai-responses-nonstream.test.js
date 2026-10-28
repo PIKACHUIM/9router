@@ -78,6 +78,17 @@ describe("non-stream Chat upstream for a Responses-API client (op-ericding bug)"
     expect(msg.content[0].text).toBe("hello");
   });
 
+  it("returns native Responses output when a Claude upstream answers synchronously", () => {
+    const out = translateNonStreamingResponse({
+      id: "msg-test", type: "message", model: "claude-test", role: "assistant",
+      content: [{ type: "text", text: "hello" }, { type: "tool_use", id: "call_1", name: "shell", input: { cmd: "pwd" } }],
+      stop_reason: "tool_use", usage: { input_tokens: 10, output_tokens: 5 },
+    }, FORMATS.CLAUDE, FORMATS.OPENAI_RESPONSES);
+    expect(out.object).toBe("response");
+    expect(out.output.find((item) => item.type === "message").content[0].text).toBe("hello");
+    expect(out.output.find((item) => item.type === "function_call")).toMatchObject({ name: "shell", arguments: '{"cmd":"pwd"}' });
+  });
+
   it("leaves chat->chat untouched", () => {
     const out = translateNonStreamingResponse(CHAT_TOOL_BODY, FORMATS.OPENAI, FORMATS.OPENAI);
     expect(out.object).toBe("chat.completion");

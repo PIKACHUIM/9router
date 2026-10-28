@@ -25,8 +25,11 @@ export default function ProfilePage() {
   const [langOpen, setLangOpen] = useState(false);
   const [shutdownOpen, setShutdownOpen] = useState(false);
   const [isShuttingDown, setIsShuttingDown] = useState(false);
-  const [settings, setSettings] = useState({ fallbackStrategy: "fill-first" });
+  const [settings, setSettings] = useState({ fallbackStrategy: "fill-first", responseMode: "auto" });
   const [loading, setLoading] = useState(true);
+  const [responseModeSaving, setResponseModeSaving] = useState(false);
+  const [responseModeStatus, setResponseModeStatus] = useState({ type: "", message: "" });
+  const responseModeSavingRef = useRef(false);
   const [passwords, setPasswords] = useState({ current: "", new: "", confirm: "" });
   const [passStatus, setPassStatus] = useState({ type: "", message: "" });
   const [passLoading, setPassLoading] = useState(false);
@@ -274,6 +277,35 @@ export default function ProfilePage() {
       }
     } catch (err) {
       console.error("Failed to update settings:", err);
+    }
+  };
+
+  const updateResponseMode = async (responseMode) => {
+    if (loading || responseModeSavingRef.current || responseMode === (settings.responseMode || "auto")) return;
+
+    responseModeSavingRef.current = true;
+    setResponseModeSaving(true);
+    setResponseModeStatus({ type: "", message: "" });
+
+    try {
+      const res = await fetch("/api/settings", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ responseMode }),
+      });
+      const data = await res.json();
+
+      if (res.ok) {
+        setSettings((prev) => ({ ...prev, responseMode: data.responseMode }));
+        setResponseModeStatus({ type: "success", message: "Response mode saved" });
+      } else {
+        setResponseModeStatus({ type: "error", message: data.error || "Failed to save response mode" });
+      }
+    } catch (err) {
+      setResponseModeStatus({ type: "error", message: "Failed to save response mode" });
+    } finally {
+      responseModeSavingRef.current = false;
+      setResponseModeSaving(false);
     }
   };
 
@@ -1542,6 +1574,58 @@ export default function ProfilePage() {
                 ? ` Combos rotate after ${settings.comboStickyRoundRobinLimit || 1} call${(settings.comboStickyRoundRobinLimit || 1) === 1 ? "" : "s"} per model.`
                 : " Combos always start with their first model."}
             </p>
+          </div>
+        </Card>
+
+        <Card>
+          <div className="flex items-center gap-3 mb-4">
+            <div className="p-2 rounded-lg bg-blue-500/10 text-blue-500 shrink-0">
+              <span className="material-symbols-outlined text-[20px]">stream</span>
+            </div>
+            <h3 className="text-base sm:text-lg font-semibold">Response Mode</h3>
+          </div>
+          <div className="flex flex-col gap-4" aria-busy={responseModeSaving}>
+            <p className="text-xs sm:text-sm text-text-muted">
+              Control whether API responses stream to clients. Changes are saved immediately.
+            </p>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3" role="group" aria-label="Response Mode">
+              {[
+                { value: "auto", label: "Auto", desc: "Follow the request's stream setting (default)." },
+                { value: "force-stream", label: "Force Streaming", desc: "Always return a streaming response, even when stream is false or omitted." },
+                { value: "force-non-stream", label: "Force Non-Streaming", desc: "Always return complete JSON, even when stream is true. Responses from streaming-only providers are aggregated." },
+              ].map((opt) => (
+                <div key={opt.value} className="flex flex-col gap-2">
+                  <Button
+                    type="button"
+                    variant={(settings.responseMode || "auto") === opt.value ? "primary" : "secondary"}
+                    fullWidth
+                    disabled={loading || responseModeSaving}
+                    aria-pressed={(settings.responseMode || "auto") === opt.value}
+                    onClick={() => updateResponseMode(opt.value)}
+                  >
+                    {opt.label}
+                  </Button>
+                  <p className="text-xs text-text-muted">{opt.desc}</p>
+                </div>
+              ))}
+            </div>
+            <p className="text-xs sm:text-sm text-amber-600 dark:text-amber-400 pt-2 border-t border-border/50">
+              Clients must support the response protocol selected by a forced mode, regardless of their request&apos;s stream setting.
+            </p>
+            {responseModeSaving && (
+              <p className="text-xs sm:text-sm text-text-muted" role="status">Saving response mode...</p>
+            )}
+            {responseModeStatus.message && (
+              <p
+                className={cn(
+                  "text-xs sm:text-sm",
+                  responseModeStatus.type === "success" ? "text-green-600 dark:text-green-400" : "text-red-500"
+                )}
+                role={responseModeStatus.type === "error" ? "alert" : "status"}
+              >
+                {responseModeStatus.message}
+              </p>
+            )}
           </div>
         </Card>
 

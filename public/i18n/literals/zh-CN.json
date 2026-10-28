@@ -1512,5 +1512,18 @@
   "Singapore": "新加坡",
   "Europe · Amsterdam": "欧洲 · 阿姆斯特丹",
   "Russia": "俄罗斯",
-  "India": "印度"
+  "India": "印度",
+  "Response Mode": "响应模式",
+  "Control whether API responses stream to clients. Changes are saved immediately.": "设置 API 向客户端返回流式还是同步响应，选择后立即保存。",
+  "Auto": "自动",
+  "Force Streaming": "强制流式",
+  "Force Non-Streaming": "强制同步",
+  "Follow the request's stream setting (default).": "遵循请求的 stream 设置（默认）。",
+  "Always return a streaming response, even when stream is false or omitted.": "始终返回流式响应，即使请求的 stream 为 false 或未设置。",
+  "Always return complete JSON, even when stream is true. Responses from streaming-only providers are aggregated.": "始终返回完整 JSON，即使请求的 stream 为 true；仅支持流式的提供商会先聚合响应。",
+  "Clients must support the response protocol selected by a forced mode, regardless of their request's stream setting.": "客户端必须支持强制模式选定的响应协议，无论请求中的 stream 如何设置。",
+  "Saving response mode...": "正在保存响应模式...",
+  "Response mode saved": "响应模式已保存",
+  "Failed to save response mode": "保存响应模式失败",
+  "Invalid response mode. Use auto, force-stream, or force-non-stream.": "响应模式无效，请使用 auto、force-stream 或 force-non-stream。"
 }

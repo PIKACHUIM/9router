@@ -6,7 +6,7 @@ import { addBufferToUsage, filterUsageForFormat } from "../../utils/usageTrackin
 import { createErrorResult } from "../../utils/error.js";
 import { upstreamResponseHeaders } from "../../utils/upstreamHeaders.js";
 import { HTTP_STATUS } from "../../config/runtimeConfig.js";
-import { parseSSEToOpenAIResponse } from "./sseToJsonHandler.js";
+import { enforceResponseMode } from "../../utils/responseMode.js";
 import { unwrapClineEnvelope } from "../../shared/clineEnvelope.js";
 import { buildRequestDetail, extractRequestConfig, extractUsageFromResponse, saveUsageStats, formatDoneLine } from "./requestDetail.js";
 import { appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
@@ -96,6 +96,10 @@ function openAICompletionToResponses(responseBody, customToolNames = null) {
  */
 export function translateNonStreamingResponse(responseBody, targetFormat, sourceFormat, customToolNames = null) {
   if (targetFormat === sourceFormat) return responseBody;
+  if (targetFormat !== FORMATS.OPENAI && (sourceFormat === FORMATS.OPENAI_RESPONSES || sourceFormat === FORMATS.CLAUDE)) {
+    const completion = translateNonStreamingResponse(responseBody, targetFormat, FORMATS.OPENAI, customToolNames);
+    if (completion?.choices) return translateNonStreamingResponse(completion, FORMATS.OPENAI, sourceFormat, customToolNames);
+  }
   // Provider responded in OpenAI Chat Completions shape but the client speaks
   // Responses API — convert so tool_calls/text surface as Responses `output`.
   if (targetFormat === FORMATS.OPENAI && sourceFormat === FORMATS.OPENAI_RESPONSES) {
@@ -236,17 +240,17 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
  */
 export async function handleNonStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, customToolNames, trackDone, appendLog, pxpipe, reqTag, log }) {
   trackDone();
-  const contentType = providerResponse.headers.get("content-type") || "";
+  const contentType = (providerResponse.headers.get("content-type") || "").toLowerCase();
   let responseBody;
 
   if (contentType.includes("text/event-stream")) {
-    const sseText = await providerResponse.text();
-    const parsed = parseSSEToOpenAIResponse(sseText, model);
-    if (!parsed) {
-      appendLog({ status: `FAILED ${HTTP_STATUS.BAD_GATEWAY}` });
-      return createErrorResult(HTTP_STATUS.BAD_GATEWAY, "Invalid SSE response for non-streaming request");
+    const converted = await enforceResponseMode(providerResponse, "force-non-stream", targetFormat, model);
+    if (!converted.ok) {
+      const failure = await converted.json();
+      appendLog({ status: `FAILED ${converted.status}` });
+      return createErrorResult(converted.status, failure.error?.message || "Invalid SSE response for non-streaming request", null, upstreamResponseHeaders(providerResponse.headers));
     }
-    responseBody = parsed;
+    responseBody = await converted.json();
   } else {
     try {
       responseBody = await providerResponse.json();

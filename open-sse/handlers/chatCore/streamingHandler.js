@@ -10,6 +10,8 @@ import { buildRequestDetail, extractRequestConfig, saveUsageStats, formatDoneLin
 import { saveRequestDetail } from "@/lib/usageDb.js";
 import { SSE_HEADERS_CORS as SSE_HEADERS } from "../../utils/sseConstants.js";
 import { upstreamResponseHeaders } from "../../utils/upstreamHeaders.js";
+import { enforceResponseMode } from "../../utils/responseMode.js";
+import { createErrorResult } from "../../utils/error.js";
 
 // Codex returns Responses API SSE → which client format to translate INTO, by request sourceFormat.
 // Gemini-family all map to ANTIGRAVITY decoder; unknown sources fall back to OPENAI.
@@ -49,14 +51,6 @@ function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent,
  * Handle streaming response — pipe provider SSE through transform stream to client.
  */
 export async function handleStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, userAgent, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, customToolNames, streamController, onStreamComplete, streamDetailId, pxpipe, reqTag, log, credentials }) {
-  if (onRequestSuccess) {
-    Promise.resolve()
-      .then(onRequestSuccess)
-      .catch(err => {
-        console.error("[ChatCore] onRequestSuccess failed:", err?.message || err);
-      });
-  }
-
   // When upstream returns HTML/text instead of SSE (e.g. Cloudflare 5xx error
   // page), piping it through the SSE transform stream causes Next.js
   // "failed to pipe response" and crashes the chat router. Read the body,
@@ -82,6 +76,28 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
         headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
       }),
     };
+  }
+
+  if (upstreamContentType.includes("application/json")) {
+    const jsonBody = await providerResponse.clone().json().catch(() => null);
+    if (jsonBody) {
+      const responseFormat = Array.isArray(jsonBody.choices) ? FORMATS.OPENAI : targetFormat;
+      providerResponse = await enforceResponseMode(providerResponse, "force-stream", responseFormat, model);
+      if (!providerResponse.ok) {
+        const failure = await providerResponse.json();
+        streamController?.handleError?.(new Error(failure.error?.message));
+        return createErrorResult(providerResponse.status, failure.error?.message || "Invalid JSON response for streaming request");
+      }
+      targetFormat = responseFormat;
+    }
+  }
+
+  if (onRequestSuccess) {
+    Promise.resolve()
+      .then(onRequestSuccess)
+      .catch(err => {
+        console.error("[ChatCore] onRequestSuccess failed:", err?.message || err);
+      });
   }
 
   const transformStream = buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, customToolNames, model, connectionId, body, onStreamComplete, apiKey, credentials });

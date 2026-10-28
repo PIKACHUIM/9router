@@ -10,6 +10,7 @@ import { getModelTargetFormat, getModelSupportedFormats, getModelStrip, getModel
 import { PROVIDERS } from "../config/providers.js";
 import { createErrorResult, parseUpstreamError, formatProviderError } from "../utils/error.js";
 import { upstreamResponseHeaders } from "../utils/upstreamHeaders.js";
+import { enforceResponseMode } from "../utils/responseMode.js";
 import { HTTP_STATUS, TOKEN_SAVER_HEADER, CONTEXT_BUDGET_HEADER, CONTEXT_BUDGET_ENABLED, CONTEXT_BUDGET_RATIO } from "../config/runtimeConfig.js";
 import { handleBypassRequest } from "../utils/bypassHandler.js";
 import { trackPendingRequest, appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
@@ -142,7 +143,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   const preTranslateRtkLine = formatRtkLog(preTranslateRtk);
   if (preTranslateRtkLine) console.log(preTranslateRtkLine);
 
-  const clientRequestedStreaming = body.stream === true || sourceFormat === FORMATS.ANTIGRAVITY || sourceFormat === FORMATS.GEMINI || sourceFormat === FORMATS.GEMINI_CLI;
+  const clientRequestedStreaming = body.stream === true || (body.stream !== false && (sourceFormat === FORMATS.ANTIGRAVITY || sourceFormat === FORMATS.GEMINI || sourceFormat === FORMATS.GEMINI_CLI));
   const providerRequiresStreaming = PROVIDERS[provider]?.forceStream === true;
   let stream = providerRequiresStreaming ? true : (body.stream !== false);
 
@@ -226,6 +227,12 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     delete translatedBody._customToolNames;
     translatedBody.model = stripThinkingSuffix(upstreamModel);
     stripContinuityFields(translatedBody);
+  }
+
+  if (targetFormat === FORMATS.OPENAI_RESPONSES && translatedBody.stream === true) stream = true;
+  if ([FORMATS.OPENAI, FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI_RESPONSE, FORMATS.CLAUDE].includes(targetFormat)) {
+    translatedBody = { ...translatedBody, stream };
+    if (!stream) delete translatedBody.stream_options;
   }
 
   // Tool normalization: MCP-equivalent built-in dedup (Claude clients) + same-name
@@ -544,12 +551,21 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   // non-stream OpenAI/native client behind a Responses upstream must also take
   // this path — handleForcedSSEToJson returns null when the body is not SSE.
   if (!clientRequestedStreaming && (providerRequiresStreaming || providerResponseFormat === FORMATS.OPENAI_RESPONSES)) {
+    if (providerResponseFormat === FORMATS.OPENAI_RESPONSES && (providerResponse.headers.get("content-type") || "").toLowerCase().includes("application/json")) {
+      providerResponse = await enforceResponseMode(providerResponse, "force-stream", providerResponseFormat, model);
+      if (!providerResponse.ok) {
+        const failure = await providerResponse.json();
+        trackDone();
+        streamController.handleComplete();
+        return createErrorResult(providerResponse.status, failure.error?.message || "Invalid Responses API response");
+      }
+    }
     const result = await handleForcedSSEToJson({ ...sharedCtx, providerResponse, sourceFormat, targetFormat: providerResponseFormat, customToolNames, toolNameMap, trackDone, appendLog });
     if (result) { streamController.handleComplete(); return result; }
   }
 
   // True non-streaming response
-  if (!stream) {
+  if (!stream || (!clientRequestedStreaming && (providerRequiresStreaming || providerResponseFormat === FORMATS.OPENAI_RESPONSES))) {
     const result = await handleNonStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat: providerResponseFormat, reqLogger, toolNameMap, customToolNames, trackDone, appendLog });
     streamController.handleComplete();
     return result;

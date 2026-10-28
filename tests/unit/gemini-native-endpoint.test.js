@@ -24,6 +24,11 @@ vi.mock("@/lib/localDb", () => ({
   getSettings: mocks.getSettings,
 }));
 
+vi.mock("@/sse/services/keyAccess.js", () => ({
+  getKeyAccessContext: vi.fn().mockResolvedValue(null),
+  enforceKeyAccessResolved: vi.fn().mockResolvedValue(null),
+}));
+
 const { GET } = await import("../../src/app/api/v1beta/models/route.js");
 const { POST } = await import("../../src/app/api/v1beta/models/[...path]/route.js");
 
@@ -247,6 +252,65 @@ describe("Gemini native v1beta endpoint", () => {
 
     expect(mocks.handleChat).toHaveBeenCalledTimes(1);
     expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it("converts an actual SSE response even when generateContent requested JSON", async () => {
+    mocks.handleChat.mockResolvedValueOnce(new Response(
+      `data: ${JSON.stringify({ choices: [{ delta: { content: "hello" }, finish_reason: null }] })}\n\n`
+      + `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 } })}\n\n`
+      + "data: [DONE]\n\n",
+      { headers: { "Content-Type": "text/event-stream; charset=utf-8" } },
+    ));
+    const response = await POST(makeGeminiRequest("gemini-2.5-flash:generateContent", {
+      contents: [{ parts: [{ text: "hello" }] }],
+    }), { params: Promise.resolve({ path: ["gemini-2.5-flash:generateContent"] }) });
+
+    expect((await mocks.handleChat.mock.calls[0][0].json()).stream).toBe(false);
+    expect(response.headers.get("content-type")).toContain("text/event-stream");
+    const text = await response.text();
+    const chunks = text.split("\n").filter((line) => line.startsWith("data: "))
+      .map((line) => JSON.parse(line.slice(6)));
+    expect(chunks[0].candidates[0].content.parts).toEqual([{ text: "hello" }]);
+    expect(chunks.at(-1).candidates[0].finishReason).toBe("STOP");
+    expect(chunks.at(-1).usageMetadata.totalTokenCount).toBe(5);
+    expect(text).not.toContain("[DONE]");
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it("converts an actual JSON response even when streamGenerateContent requested SSE", async () => {
+    mocks.handleChat.mockResolvedValueOnce(Response.json({
+      model: "gemini-2.5-flash",
+      choices: [{ message: { role: "assistant", content: "hello", reasoning_content: "thought" }, finish_reason: "length" }],
+      usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+    }));
+    const response = await POST(makeGeminiRequest("gemini-2.5-flash:streamGenerateContent", {
+      contents: [{ parts: [{ text: "hello" }] }],
+    }), { params: Promise.resolve({ path: ["gemini-2.5-flash:streamGenerateContent"] }) });
+
+    expect((await mocks.handleChat.mock.calls[0][0].json()).stream).toBe(true);
+    expect(response.headers.get("content-type")).toContain("application/json");
+    const body = await response.json();
+    expect(body.candidates[0].content.parts).toEqual([{ text: "thought", thought: true }, { text: "hello" }]);
+    expect(body.candidates[0].finishReason).toBe("MAX_TOKENS");
+    expect(body.usageMetadata.totalTokenCount).toBe(5);
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it.each(["generateContent", "streamGenerateContent"])("preserves non-ok chat errors for %s", async (action) => {
+    const upstreamResponse = Response.json({ error: { message: "rate limited" } }, {
+      status: 429,
+      headers: { "Retry-After": "12", "Access-Control-Allow-Origin": "*" },
+    });
+    mocks.handleChat.mockResolvedValueOnce(upstreamResponse);
+    const path = `gemini-2.5-flash:${action}`;
+    const response = await POST(makeGeminiRequest(path, { contents: [] }), {
+      params: Promise.resolve({ path: [path] }),
+    });
+
+    expect(response).toBe(upstreamResponse);
+    expect(response.status).toBe(429);
+    expect(response.headers.get("retry-after")).toBe("12");
+    expect(await response.json()).toEqual({ error: { message: "rate limited" } });
   });
 
   it("does not hijack provider-prefixed non-Gemini audio requests", async () => {

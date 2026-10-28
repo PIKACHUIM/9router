@@ -1,5 +1,52 @@
-// Transform OpenAI SSE stream to Ollama JSON lines format
-export function transformToOllama(response, model) {
+// Convert OpenAI JSON or SSE responses to the corresponding Ollama format.
+export async function transformToOllama(response, model) {
+  if (!response.ok) return response;
+
+  if (response.headers.get("content-type")?.toLowerCase().includes("application/json")) {
+    let body;
+    try {
+      body = await response.clone().json();
+    } catch {
+      return response;
+    }
+    if (body.error || !body.choices?.[0]) return response;
+
+    const choice = body.choices[0];
+    const sourceMessage = choice.message || {};
+    const message = { role: "assistant", content: sourceMessage.content || "" };
+    if (sourceMessage.reasoning_content) message.thinking = sourceMessage.reasoning_content;
+    if (sourceMessage.tool_calls?.length) {
+      message.tool_calls = sourceMessage.tool_calls.map((toolCall) => {
+        let args = toolCall.function?.arguments || {};
+        if (typeof args === "string") {
+          try { args = JSON.parse(args); } catch { args = {}; }
+        }
+        if (!args || typeof args !== "object" || Array.isArray(args)) args = {};
+        return { function: { name: toolCall.function?.name || "", arguments: args } };
+      });
+    }
+
+    const ollama = {
+      model,
+      created_at: new Date(body.created ? body.created * 1000 : Date.now()).toISOString(),
+      message,
+      done: true,
+      done_reason: choice.finish_reason === "length" ? "length" : "stop",
+    };
+    if (body.usage) {
+      ollama.prompt_eval_count = body.usage.prompt_tokens || 0;
+      ollama.eval_count = body.usage.completion_tokens || 0;
+    }
+
+    const headers = new Headers(response.headers);
+    headers.delete("content-length");
+    headers.delete("content-encoding");
+    headers.delete("transfer-encoding");
+    headers.set("Content-Type", "application/json");
+    if (!headers.has("Access-Control-Allow-Origin")) headers.set("Access-Control-Allow-Origin", "*");
+    return Response.json(ollama, { status: response.status, statusText: response.statusText, headers });
+  }
+
   let buffer = "";
   let pendingToolCalls = {};
   

@@ -32,6 +32,8 @@ vi.mock("@/sse/services/auth.js", () => ({
   getProviderCredentials: mocks.getProviderCredentials,
   markAccountUnavailable: vi.fn(async () => ({ shouldFallback: false })),
   clearAccountError: vi.fn(),
+  releaseAccountSlot: vi.fn(),
+  refundAccountQuotaDiscount: vi.fn(),
   extractApiKey: (request) => {
     const a = request.headers.get("Authorization");
     return a?.startsWith("Bearer ") ? a.slice(7) : request.headers.get("x-api-key");

@@ -39,6 +39,16 @@ export async function PATCH(request) {
   try {
     const body = await request.json();
 
+    if (
+      Object.prototype.hasOwnProperty.call(body, "responseMode") &&
+      !["auto", "force-stream", "force-non-stream"].includes(body.responseMode)
+    ) {
+      return NextResponse.json(
+        { error: "Invalid response mode. Use auto, force-stream, or force-non-stream." },
+        { status: 400 }
+      );
+    }
+
     // Strip protected secrets before any internal handling sets them
     for (const key of PROTECTED_SETTING_KEYS) delete body[key];
 

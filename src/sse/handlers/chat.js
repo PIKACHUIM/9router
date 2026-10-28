@@ -23,6 +23,8 @@ import { augmentModelsWithCapacityAdapter, withCapacityAdapterStripping, getActi
 import { handleBypassRequest } from "open-sse/utils/bypassHandler.js";
 import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import { detectFormatByEndpoint } from "open-sse/translator/formats.js";
+import { detectFormat } from "open-sse/services/provider.js";
+import { applyResponseMode, enforceResponseMode } from "open-sse/utils/responseMode.js";
 import { resolveSessionIdentity } from "open-sse/utils/sessionManager.js";
 import * as log from "../utils/logger.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
@@ -40,6 +42,34 @@ import { resolveSmartChoice } from "../services/systemoneRouter.js";
  * Format detection and translation handled by translator
  */
 export async function handleChat(request, clientRawRequest = null) {
+  const settings = await getSettings();
+  const mode = settings.responseMode || "auto";
+  if (mode !== "force-stream" && mode !== "force-non-stream") {
+    return handleChatRequest(request, clientRawRequest, settings);
+  }
+
+  let originalBody;
+  try {
+    originalBody = await request.clone().json();
+  } catch {
+    return handleChatRequest(request, clientRawRequest, settings);
+  }
+  const body = applyResponseMode(originalBody, mode);
+  const endpoint = new URL(request.url).pathname;
+  const rawRequest = clientRawRequest || {
+    endpoint,
+    body: originalBody,
+    headers: Object.fromEntries(request.headers.entries())
+  };
+  const headers = new Headers(request.headers);
+  headers.delete("content-length");
+  const effectiveRequest = new Request(request, { headers, body: JSON.stringify(body) });
+  const response = await handleChatRequest(effectiveRequest, rawRequest, settings);
+  const sourceFormat = detectFormatByEndpoint(endpoint, body) || detectFormat(body);
+  return enforceResponseMode(response, mode, sourceFormat, body.model);
+}
+
+async function handleChatRequest(request, clientRawRequest = null, settings) {
   let body;
   try {
     body = await request.json();
@@ -79,7 +109,6 @@ export async function handleChat(request, clientRawRequest = null) {
   }
 
   // Enforce API key if enabled in settings
-  const settings = await getSettings();
   if (settings.requireApiKey) {
     if (!apiKey) {
       log.warn("AUTH", "Missing API key (requireApiKey=true)");

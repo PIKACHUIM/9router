@@ -47,9 +47,8 @@ export async function OPTIONS() {
  * convention), NOT by a body field. generationConfig.stream is not a real
  * Gemini API field and Gemini CLI never sets it.
  *
- * The @google/genai SDK always uses :streamGenerateContent?alt=sse for chat.
- * The upstream handleChat returns OpenAI SSE format; we transform it to
- * Gemini SSE format on the fly via transformOpenAISSEToGeminiSSE().
+ * The URL action sets the requested mode; global chat settings may override it.
+ * Convert the actual handleChat response from OpenAI SSE or JSON to Gemini.
  */
 export async function POST(request, { params }) {
   await ensureInitialized();
@@ -106,10 +105,10 @@ export async function POST(request, { params }) {
 
     const response = await handleChat(newRequest);
 
-    if (stream) {
-      // Transform OpenAI SSE => Gemini SSE on the fly.
-      // The @google/genai SDK always uses :streamGenerateContent?alt=sse and
-      // expects Gemini SSE chunks (no [DONE] sentinel — stream just closes).
+    if (!response.ok) return response;
+
+    if (response.headers.get("content-type")?.toLowerCase().includes("text/event-stream")) {
+      // Transform the actual OpenAI SSE response, even when the URL requested JSON.
       return transformOpenAISSEToGeminiSSE(response, model);
     } else {
       // Convert OpenAI JSON response => Gemini GenerateContentResponse
