@@ -58,6 +58,9 @@ const DEFAULT_SETTINGS = {
   cavemanLevel: "full",
   ponytailEnabled: false,
   ponytailLevel: "full",
+  // User-authored system prompt, injected independently of the built-in savers.
+  customPromptEnabled: false,
+  customPrompt: "",
   pxpipeEnabled: false,
   pxpipeAutoInstall: true,
   pxpipeMinChars: 25000,
@@ -127,6 +130,8 @@ const DEFAULT_SETTINGS = {
   // Per-account opt-in map: { connections: { [connectionId]: true } }.
   // The scheduler signs in each enabled account once per day.
   codebuddyCheckin: { connections: {} },
+  // Per-provider user header overrides applied at dispatch: { [providerId]: { headers: {..} } }
+  providerOverrides: {},
 };
 
 async function readRaw() {
