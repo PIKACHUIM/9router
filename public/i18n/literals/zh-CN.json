@@ -1525,5 +1525,11 @@
   "Saving response mode...": "正在保存响应模式...",
   "Response mode saved": "响应模式已保存",
   "Failed to save response mode": "保存响应模式失败",
-  "Invalid response mode. Use auto, force-stream, or force-non-stream.": "响应模式无效，请使用 auto、force-stream 或 force-non-stream。"
+  "Invalid response mode. Use auto, force-stream, or force-non-stream.": "响应模式无效，请使用 auto、force-stream 或 force-non-stream。",
+  "Client Conversion": "客户端转换",
+  "Auto (detect CodeBuddy / WorkBuddy)": "自动（识别 CodeBuddy / WorkBuddy）",
+  "CodeBuddy client": "CodeBuddy 客户端",
+  "WorkBuddy client": "WorkBuddy 客户端",
+  "Off (leave headers unchanged)": "关闭（不修改请求头）",
+  "Sends the official client's User-Agent and marker headers upstream. Gateways that only accept CodeBuddy / WorkBuddy clients need this.": "向上游发送官方客户端的 User-Agent 与标记请求头；仅接受 CodeBuddy / WorkBuddy 官方客户端的网关需要开启。"
 }

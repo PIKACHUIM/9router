@@ -9,6 +9,7 @@ import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
 import { stripUnsupportedParams } from "../translator/concerns/paramSupport.js";
 import { extractClaudeSessionIdFromUserId } from "../utils/claudeCloaking.js";
+import { applyClientProfile, resolveClientProfile } from "../providers/clientProfiles.js";
 
 // Auth header descriptors — derived from registry transport.auth, fallback to hardcoded defaults.
 const BEARER = { combined: true, header: "Authorization", scheme: "bearer" };
@@ -189,6 +190,12 @@ export class DefaultExecutor extends BaseExecutor {
     // Hooks run BEFORE auth so dynamic overlays can't clobber the token.
     for (const hook of desc.hooks || []) HEADER_HOOKS[hook]?.(headers, credentials);
     applyAuth(headers, desc, credentials);
+
+    // Client identity conversion: CodeBuddy/WorkBuddy channels (including reseller
+    // nodes pointed at the same gateway) only accept requests that look like the
+    // official desktop clients — UA plus marker headers. A per-connection
+    // `clientProfile` selection wins over channel detection.
+    applyClientProfile(headers, resolveClientProfile({ provider: this.provider, credentials }));
 
     // anthropic-compatible-* nodes serving a real Claude model sit in front of
     // Anthropic itself (a rotating multi-account proxy, a corporate gateway),

@@ -1,3 +1,5 @@
+import { clientProfileHeaders } from "../clientProfiles.js";
+
 export default {
   id: "codebuddy-cn",
   // Short model prefix (cbcn/glm-5.2). "cbcn" = CodeBuddy CN; reserve "cbai"
@@ -25,14 +27,10 @@ export default {
     // MiniMax, DeepSeek, Hunyuan) takes reasoning via OpenAI-style reasoning_effort,
     // not its vendor-native thinking shape. Force the openai thinking format.
     thinkingFormat: "openai",
-    headers: {
-      "User-Agent": "CLI/2.108.1 CodeBuddy/2.108.1",
-      "X-Product": "SaaS",
-      "X-IDE-Type": "CLI",
-      "X-IDE-Name": "CLI",
-      "x-requested-with": "XMLHttpRequest",
-      "x-codebuddy-request": "1",
-    },
+    // Client identity is the official CodeBuddy IDE client: the gateway (and the
+    // relays in front of it) gate on both the UA and the X-IDE-* markers.
+    // Single source: providers/clientProfiles.js.
+    headers: clientProfileHeaders("codebuddy"),
     auth: {
       combined: true,
       header: "Authorization",

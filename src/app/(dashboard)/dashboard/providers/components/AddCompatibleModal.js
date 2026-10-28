@@ -3,6 +3,7 @@
 import { useState, useEffect } from "react";
 import PropTypes from "prop-types";
 import { Badge, Button, Input, Modal, Select } from "@/shared/components";
+import { CLIENT_PROFILE_UI_OPTIONS, normalizeClientProfile } from "open-sse/providers/clientProfiles.js";
 
 const VARIANT_CONFIG = {
   openai: {
@@ -41,6 +42,7 @@ function AddCompatibleModal({ variant, isOpen, onClose, onCreated }) {
     prefix: "",
     ...(config.hasApiType ? { apiType: "chat" } : {}),
     baseUrl: config.defaultBaseUrl,
+    clientProfile: "auto",
   });
 
   const [formData, setFormData] = useState(initialFormData);
@@ -74,6 +76,7 @@ function AddCompatibleModal({ variant, isOpen, onClose, onCreated }) {
           ...(config.hasApiType ? { apiType: formData.apiType } : {}),
           baseUrl: formData.baseUrl,
           type: config.type,
+          clientProfile: normalizeClientProfile(formData.clientProfile),
         }),
       });
       const data = await res.json();
@@ -164,6 +167,13 @@ function AddCompatibleModal({ variant, isOpen, onClose, onCreated }) {
           onChange={(e) => setFormData({ ...formData, baseUrl: e.target.value })}
           placeholder={config.defaultBaseUrl}
           hint={config.baseUrlHint}
+        />
+        <Select
+          label="Client Conversion"
+          options={CLIENT_PROFILE_UI_OPTIONS}
+          value={formData.clientProfile}
+          onChange={(e) => setFormData({ ...formData, clientProfile: e.target.value })}
+          hint="Sends the official client's User-Agent and marker headers upstream. Gateways that only accept CodeBuddy / WorkBuddy clients need this."
         />
         <Input
           label="API Key (for Check)"

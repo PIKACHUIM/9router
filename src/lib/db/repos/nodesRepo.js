@@ -62,6 +62,8 @@ export async function createProviderNode(data) {
     prefix: data.prefix,
     apiType: data.apiType,
     baseUrl: data.baseUrl,
+    // Client identity the channel presents upstream: auto | codebuddy | workbuddy | none
+    clientProfile: data.clientProfile || "auto",
     createdAt: now,
     updatedAt: now,
   };
