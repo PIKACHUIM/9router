@@ -12,6 +12,11 @@ import { WORKBUDDY_SYSTEM_PROMPT } from "./workbuddySystemPrompt.js";
 
 export const DEFAULT_CLIENT_SYSTEM_PROMPT = WORKBUDDY_SYSTEM_PROMPT;
 
+// What the real CodeBuddy client opens every request with. Both gateways reject
+// a conversation that starts with a user turn (11101 "invalid request"), and the
+// neutralized prompt they accept is the same sentence.
+export const CODEBUDDY_SYSTEM_PROMPT = "You are CodeBuddy Code.";
+
 // Guard against storing/sending an unbounded body.
 export const MAX_PROMPT_CHARS = 400_000;
 

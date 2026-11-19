@@ -1,4 +1,6 @@
 import { DefaultExecutor } from "./default.js";
+import { resolveClientIdentity } from "../providers/clientProfiles.js";
+import { CODEBUDDY_SYSTEM_PROMPT, resolveClientSystemPrompt } from "../providers/defaultPrompts.js";
 
 /**
  * CodeBuddyExecutor — talks to https://copilot.tencent.com/v2/chat/completions
@@ -33,11 +35,20 @@ export class CodeBuddyExecutor extends DefaultExecutor {
         : Array.isArray(content)
           ? content.map((b) => (b && typeof b.text === "string" ? b.text : "")).join("\n")
           : "";
+    // A prompt the operator configured (the WorkBuddy prompt, or a node's own
+    // text) is first-party content the gateway expects. The 2 000-character
+    // catch-all below exists to catch third-party agent prompts, and would
+    // otherwise replace a configured prompt with the neutral one.
+    const configuredPrompt = resolveClientSystemPrompt({
+      identity: resolveClientIdentity({ provider: this.provider, credentials }),
+      credentials,
+    }).trim();
     if (Array.isArray(transformed.messages)) {
       transformed.messages = transformed.messages.map((message) => {
         if (!message || message.role !== "system") return message;
         const text = flatten(message.content);
         if (!text) return message;
+        if (configuredPrompt && text.trim() === configuredPrompt) return message;
         if (text.length > 2000 || AGENT_PATTERN.test(text)) {
           return typeof message.content === "string"
             ? { ...message, content: NEUTRAL_PROMPT }
@@ -45,6 +56,15 @@ export class CodeBuddyExecutor extends DefaultExecutor {
         }
         return message;
       });
+      // The gateway rejects a conversation that opens with a user turn; the
+      // international gateway gets the same leading prompt (see
+      // executors/codebuddy-intl.js).
+      const hasSystem = transformed.messages.some((message) => (
+        message && ["system", "developer"].includes(message.role)
+      ));
+      if (!hasSystem) {
+        transformed.messages = [{ role: "system", content: CODEBUDDY_SYSTEM_PROMPT }, ...transformed.messages];
+      }
     }
 
     // CodeBuddy only surfaces model reasoning when the request carries the CLI's

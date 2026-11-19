@@ -1,4 +1,6 @@
 import { DefaultExecutor } from "./default.js";
+import { resolveClientIdentity } from "../providers/clientProfiles.js";
+import { CODEBUDDY_SYSTEM_PROMPT, resolveClientSystemPrompt } from "../providers/defaultPrompts.js";
 
 /**
  * CodeBuddyIntlExecutor — talks to https://www.codebuddy.ai/v2/chat/completions
@@ -30,6 +32,13 @@ export class CodeBuddyIntlExecutor extends DefaultExecutor {
     const NEUTRAL_PROMPT = "You are a helpful AI assistant that helps with software engineering tasks.";
     const AGENT_PATTERN = /you are claude code|claude.?code.+official.+cli|anthropic.+official.+cli|anxthxropic.+official.+cli|you are (?:cursor|windsurf|cline|aider|continue|copilot|cody)|you are an? (?:ai )?(?:coding |code )?agent|cc_entrypoint\s*=\s*(?:cli|vscode|jetbrains|gui)|claude.?code.+issues|give feedback.+claude.?code|you are .{0,30}(?:powerful )?ai agent|orchestration capabilities|OhMyOpenCode|<agent-identity>|<Role>|<Behavior_Instructions>/i;
 
+    // A prompt the operator configured (the WorkBuddy prompt, or a node's own
+    // text) is first-party content the gateway expects — never neutralize it.
+    const configuredPrompt = resolveClientSystemPrompt({
+      identity: resolveClientIdentity({ provider: this.provider, credentials }),
+      credentials,
+    }).trim();
+
     // CodeBuddy rejects plain OpenAI shape (11101 invalid request): needs a
     // leading system prompt + user content as typed blocks, not a bare string.
     const source = Array.isArray(transformed.messages) ? transformed.messages : [];
@@ -42,6 +51,9 @@ export class CodeBuddyIntlExecutor extends DefaultExecutor {
             : Array.isArray(m.content)
               ? m.content.map((c) => c?.text || "").join("\n")
               : "";
+        if (text && configuredPrompt && text.trim() === configuredPrompt) {
+          return text;
+        }
         if (text && AGENT_PATTERN.test(text)) {
           return NEUTRAL_PROMPT;
         }
@@ -52,7 +64,7 @@ export class CodeBuddyIntlExecutor extends DefaultExecutor {
     const systemPromptText =
       clientSystemPrompts.length > 0
         ? clientSystemPrompts.join("\n\n")
-        : "You are CodeBuddy Code.";
+        : CODEBUDDY_SYSTEM_PROMPT;
 
     transformed.messages = [{ role: "system", content: systemPromptText }];
     for (const message of source) {
