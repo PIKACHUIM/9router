@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from "react";
 import PropTypes from "prop-types";
-import { Badge, Button, Input, Modal, Select } from "@/shared/components";
+import { Badge, Button, Input, Modal, Select, Textarea } from "@/shared/components";
 import { CLIENT_PROFILE_UI_OPTIONS, DEFAULT_CLIENT_UA, normalizeClientProfile, sanitizeClientUserAgent } from "open-sse/providers/clientProfiles.js";
 
 const VARIANT_CONFIG = {
@@ -52,6 +52,30 @@ function AddCompatibleModal({ variant, isOpen, onClose, onCreated }) {
   const [checkModelId, setCheckModelId] = useState("");
   const [validating, setValidating] = useState(false);
   const [validationResult, setValidationResult] = useState(null);
+  // System-prompt override. Seeded from the built-in prompt file so the user
+  // reads a real WorkBuddy prompt instead of an empty box.
+  const [systemPrompt, setSystemPrompt] = useState("");
+  const [defaultPrompt, setDefaultPrompt] = useState({ path: "", exists: false, prompt: "", loaded: false });
+
+  useEffect(() => {
+    if (!isOpen) return undefined;
+    let cancelled = false;
+    fetch("/api/provider-nodes/default-prompt")
+      .then((res) => res.json())
+      .then((data) => {
+        if (cancelled || !data || data.error) return;
+        // A textarea reports LF, so compare and edit the LF form.
+        const prompt = (data.prompt || "").replace(/\r\n/g, "\n");
+        setDefaultPrompt({ ...data, prompt, loaded: true });
+        setSystemPrompt((prev) => (prev.trim() ? prev : prompt));
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen]);
+
+  const promptLoading = isOpen && !defaultPrompt.loaded;
 
   // openai: reset baseUrl when apiType changes; anthropic: reset checks when opened
   useEffect(() => {
@@ -79,12 +103,16 @@ function AddCompatibleModal({ variant, isOpen, onClose, onCreated }) {
           type: config.type,
           clientProfile: normalizeClientProfile(formData.clientProfile),
           clientUserAgent: sanitizeClientUserAgent(formData.clientUserAgent),
+          // Unchanged text is stored as "" so the node keeps following the
+          // default prompt file instead of freezing today's copy.
+          clientSystemPrompt: systemPrompt.trim() === (defaultPrompt.prompt || "").trim() ? "" : systemPrompt,
         }),
       });
       const data = await res.json();
       if (res.ok) {
         onCreated(data.node);
         setFormData(initialFormData());
+        setSystemPrompt(defaultPrompt.prompt || "");
         setCheckKey("");
         setValidationResult(null);
       }
@@ -185,6 +213,43 @@ function AddCompatibleModal({ variant, isOpen, onClose, onCreated }) {
           hint="Sent upstream verbatim. Leave empty to use the default WorkBuddy UA."
           disabled={formData.clientProfile === "none"}
         />
+        <Textarea
+          label="System Prompt Override"
+          value={systemPrompt}
+          onChange={(e) => setSystemPrompt(e.target.value)}
+          rows={6}
+          placeholder={
+            promptLoading
+              ? "Loading the default prompt..."
+              : "Leave empty to use the built-in WorkBuddy prompt."
+          }
+          disabled={formData.clientProfile === "none" || promptLoading}
+          hint={
+            formData.clientProfile === "none"
+              ? "Client conversion is off, so no prompt is overridden."
+              : `Replaces the conversation's system prompt upstream. ${!defaultPrompt.loaded
+                ? "Loading the default prompt..."
+                : defaultPrompt.exists
+                  ? `Default loaded from ${defaultPrompt.path}`
+                  : `No default prompt file at ${defaultPrompt.path}`} — ${systemPrompt.length.toLocaleString()} characters.`
+          }
+        />
+        <div className="-mt-2 flex flex-wrap items-center gap-2">
+          <Button
+            variant="ghost"
+            onClick={() => setSystemPrompt(defaultPrompt.prompt || "")}
+            disabled={promptLoading || !defaultPrompt.exists}
+          >
+            Reload from file
+          </Button>
+          <Button
+            variant="ghost"
+            onClick={() => setSystemPrompt("")}
+            disabled={promptLoading || !systemPrompt}
+          >
+            Clear
+          </Button>
+        </div>
         <Input
           label="API Key (for Check)"
           type="password"

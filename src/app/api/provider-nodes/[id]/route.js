@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { deleteProviderConnectionsByProvider, deleteProviderNode, getProviderConnections, getProviderNodeById, updateProviderConnection, updateProviderNode } from "@/models";
 import { normalizeClientProfile, sanitizeClientUserAgent } from "open-sse/providers/clientProfiles.js";
+import { sanitizeClientSystemPrompt } from "open-sse/providers/defaultPrompts.js";
 
 // PUT /api/provider-nodes/[id] - Update provider node
 export async function PUT(request, { params }) {
@@ -63,6 +64,11 @@ export async function PUT(request, { params }) {
     if (Object.prototype.hasOwnProperty.call(body, "clientUserAgent")) {
       updates.clientUserAgent = sanitizeClientUserAgent(body.clientUserAgent);
     }
+    // System-prompt override. Empty string is a valid value: it means "keep
+    // using the built-in default prompt" rather than "stop overriding".
+    if (Object.prototype.hasOwnProperty.call(body, "clientSystemPrompt")) {
+      updates.clientSystemPrompt = sanitizeClientSystemPrompt(body.clientSystemPrompt);
+    }
 
     if (node.type === "openai-compatible") {
       updates.apiType = apiType;
@@ -81,6 +87,7 @@ export async function PUT(request, { params }) {
           nodeName: updated.name,
           clientProfile: updated.clientProfile || "auto",
           clientUserAgent: updated.clientUserAgent || "",
+          clientSystemPrompt: updated.clientSystemPrompt || "",
         }
       })
     )));

@@ -3,6 +3,7 @@ import { createProviderNode, getProviderNodes } from "@/models";
 import { OPENAI_COMPATIBLE_PREFIX, ANTHROPIC_COMPATIBLE_PREFIX, CUSTOM_EMBEDDING_PREFIX } from "@/shared/constants/providers";
 import { generateId } from "@/shared/utils";
 import { normalizeClientProfile, sanitizeClientUserAgent } from "open-sse/providers/clientProfiles.js";
+import { sanitizeClientSystemPrompt } from "open-sse/providers/defaultPrompts.js";
 
 export const dynamic = "force-dynamic";
 
@@ -47,6 +48,7 @@ export async function POST(request) {
     const nodeType = type || "openai-compatible";
     const clientProfile = normalizeClientProfile(body.clientProfile);
     const clientUserAgent = sanitizeClientUserAgent(body.clientUserAgent);
+    const clientSystemPrompt = sanitizeClientSystemPrompt(body.clientSystemPrompt);
 
     if (nodeType === "openai-compatible") {
       if (!apiType || !["chat", "responses"].includes(apiType)) {
@@ -62,6 +64,7 @@ export async function POST(request) {
         name: name.trim(),
         clientProfile,
         clientUserAgent,
+        clientSystemPrompt,
       });
       return NextResponse.json({ node }, { status: 201 });
     }
@@ -99,6 +102,7 @@ export async function POST(request) {
         name: name.trim(),
         clientProfile,
         clientUserAgent,
+        clientSystemPrompt,
       });
       return NextResponse.json({ node }, { status: 201 });
     }

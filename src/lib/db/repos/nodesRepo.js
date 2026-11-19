@@ -66,6 +66,8 @@ export async function createProviderNode(data) {
     clientProfile: data.clientProfile || "auto",
     // Optional User-Agent override; empty means the built-in default (WorkBuddy)
     clientUserAgent: data.clientUserAgent || "",
+    // Optional system-prompt override; empty means the built-in default prompt
+    clientSystemPrompt: data.clientSystemPrompt || "",
     createdAt: now,
     updatedAt: now,
   };

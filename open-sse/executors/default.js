@@ -10,6 +10,7 @@ import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
 import { stripUnsupportedParams } from "../translator/concerns/paramSupport.js";
 import { extractClaudeSessionIdFromUserId } from "../utils/claudeCloaking.js";
 import { applyClientProfile, resolveClientIdentity } from "../providers/clientProfiles.js";
+import { applySystemPromptOverride, resolveClientSystemPrompt } from "../providers/defaultPrompts.js";
 
 // Auth header descriptors — derived from registry transport.auth, fallback to hardcoded defaults.
 const BEARER = { combined: true, header: "Authorization", scheme: "bearer" };
@@ -113,7 +114,13 @@ export class DefaultExecutor extends BaseExecutor {
       stripUnsupportedParams(this.provider, model, transformed);
     }
 
-    return injectReasoningContent({ provider: this.provider, model, body: transformed });
+    // Prompt override: a converted channel replays the official WorkBuddy system
+    // prompt (or the node's own text) so the upstream fingerprint matches. Runs
+    // last so a provider transform that rebuilds `messages` cannot drop it.
+    const identity = resolveClientIdentity({ provider: this.provider, credentials });
+    const systemPrompt = resolveClientSystemPrompt({ identity, credentials });
+
+    return applySystemPromptOverride(injectReasoningContent({ provider: this.provider, model, body: transformed }), systemPrompt);
   }
 
   applyNousAttribution(model, body, stream, credentials) {

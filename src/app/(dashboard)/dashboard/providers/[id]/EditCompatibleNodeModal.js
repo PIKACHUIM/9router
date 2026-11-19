@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from "react";
 import PropTypes from "prop-types";
-import { Button, Badge, Input, Modal, Select } from "@/shared/components";
+import { Button, Badge, Input, Modal, Select, Textarea } from "@/shared/components";
 import { CLIENT_PROFILE_UI_OPTIONS, DEFAULT_CLIENT_UA, normalizeClientProfile, sanitizeClientUserAgent } from "open-sse/providers/clientProfiles.js";
 
 export default function EditCompatibleNodeModal({ isOpen, node, onSave, onClose, isAnthropic }) {
@@ -19,6 +19,8 @@ export default function EditCompatibleNodeModal({ isOpen, node, onSave, onClose,
   const [checkModelId, setCheckModelId] = useState("");
   const [validating, setValidating] = useState(false);
   const [validationResult, setValidationResult] = useState(null);
+  const [systemPrompt, setSystemPrompt] = useState("");
+  const [defaultPrompt, setDefaultPrompt] = useState({ path: "", exists: false, prompt: "", loaded: false });
 
   useEffect(() => {
     if (node) {
@@ -32,6 +34,30 @@ export default function EditCompatibleNodeModal({ isOpen, node, onSave, onClose,
       });
     }
   }, [node, isAnthropic]);
+
+  // Prompt override: a node without its own text follows the built-in prompt
+  // file, so the editor shows that default instead of an empty box.
+  const nodeId = node?.id;
+  useEffect(() => {
+    if (!nodeId) return undefined;
+    let cancelled = false;
+    fetch("/api/provider-nodes/default-prompt")
+      .then((res) => res.json())
+      .then((data) => {
+        if (cancelled || !data || data.error) return;
+        // A textarea reports LF, so compare and edit the LF form.
+        const prompt = (data.prompt || "").replace(/\r\n/g, "\n");
+        setDefaultPrompt({ ...data, prompt, loaded: true });
+        setSystemPrompt(node?.clientSystemPrompt || prompt);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nodeId]);
+
+  const promptLoading = Boolean(nodeId) && !defaultPrompt.loaded;
 
   const apiTypeOptions = [
     { value: "chat", label: "Chat Completions" },
@@ -48,6 +74,8 @@ export default function EditCompatibleNodeModal({ isOpen, node, onSave, onClose,
         baseUrl: formData.baseUrl,
         clientProfile: normalizeClientProfile(formData.clientProfile),
         clientUserAgent: sanitizeClientUserAgent(formData.clientUserAgent),
+        // Unchanged text stays "" so the node keeps following the default file.
+        clientSystemPrompt: systemPrompt.trim() === (defaultPrompt.prompt || "").trim() ? "" : systemPrompt,
       };
       if (!isAnthropic) {
         payload.apiType = formData.apiType;
@@ -129,6 +157,35 @@ export default function EditCompatibleNodeModal({ isOpen, node, onSave, onClose,
           hint="Sent upstream verbatim. Leave empty to use the default WorkBuddy UA."
           disabled={formData.clientProfile === "none"}
         />
+        <Textarea
+          label="System Prompt Override"
+          value={systemPrompt}
+          onChange={(e) => setSystemPrompt(e.target.value)}
+          rows={6}
+          placeholder={promptLoading ? "Loading the default prompt..." : "Leave empty to use the built-in WorkBuddy prompt."}
+          disabled={formData.clientProfile === "none" || promptLoading}
+          hint={
+            formData.clientProfile === "none"
+              ? "Client conversion is off, so no prompt is overridden."
+              : `Replaces the conversation's system prompt upstream. ${!defaultPrompt.loaded
+                ? "Loading the default prompt..."
+                : defaultPrompt.exists
+                  ? `Default loaded from ${defaultPrompt.path}`
+                  : `No default prompt file at ${defaultPrompt.path}`} — ${systemPrompt.length.toLocaleString()} characters.`
+          }
+        />
+        <div className="-mt-2 flex flex-wrap items-center gap-2">
+          <Button
+            variant="ghost"
+            onClick={() => setSystemPrompt(defaultPrompt.prompt || "")}
+            disabled={promptLoading || !defaultPrompt.exists}
+          >
+            Reload from file
+          </Button>
+          <Button variant="ghost" onClick={() => setSystemPrompt("")} disabled={promptLoading || !systemPrompt}>
+            Clear
+          </Button>
+        </div>
         <div className="flex gap-2">
           <Input
             label="API Key (for Check)"
@@ -178,6 +235,7 @@ EditCompatibleNodeModal.propTypes = {
     baseUrl: PropTypes.string,
     clientProfile: PropTypes.string,
     clientUserAgent: PropTypes.string,
+    clientSystemPrompt: PropTypes.string,
   }),
   onSave: PropTypes.func.isRequired,
   onClose: PropTypes.func.isRequired,
