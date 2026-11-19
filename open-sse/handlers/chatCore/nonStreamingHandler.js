@@ -250,7 +250,17 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
       appendLog({ status: `FAILED ${converted.status}` });
       return createErrorResult(converted.status, failure.error?.message || "Invalid SSE response for non-streaming request", null, upstreamResponseHeaders(providerResponse.headers));
     }
-    responseBody = await converted.json();
+    const parsed = await converted.json();
+    if (!converted.ok || parsed?.error) {
+      const detail = parsed?.error;
+      const upstreamStatus = Number(detail?.status);
+      const status = Number.isInteger(upstreamStatus) && upstreamStatus >= 400 && upstreamStatus <= 599
+        ? upstreamStatus
+        : converted.status >= 400 ? converted.status : HTTP_STATUS.BAD_GATEWAY;
+      appendLog({ status: `FAILED ${status}` });
+      return createErrorResult(status, detail?.message || "Invalid SSE response for non-streaming request", null, upstreamResponseHeaders(providerResponse.headers));
+    }
+    responseBody = parsed;
   } else {
     try {
       responseBody = await providerResponse.json();
