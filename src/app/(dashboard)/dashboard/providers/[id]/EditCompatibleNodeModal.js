@@ -4,6 +4,7 @@ import { useState, useEffect } from "react";
 import PropTypes from "prop-types";
 import { Button, Badge, Input, Modal, Select, Textarea } from "@/shared/components";
 import { CLIENT_PROFILE_UI_OPTIONS, DEFAULT_CLIENT_UA, normalizeClientProfile, sanitizeClientUserAgent } from "open-sse/providers/clientProfiles.js";
+import { DEFAULT_CLIENT_SYSTEM_PROMPT } from "open-sse/providers/defaultPrompts.js";
 
 export default function EditCompatibleNodeModal({ isOpen, node, onSave, onClose, isAnthropic }) {
   const [formData, setFormData] = useState({
@@ -19,8 +20,7 @@ export default function EditCompatibleNodeModal({ isOpen, node, onSave, onClose,
   const [checkModelId, setCheckModelId] = useState("");
   const [validating, setValidating] = useState(false);
   const [validationResult, setValidationResult] = useState(null);
-  const [systemPrompt, setSystemPrompt] = useState("");
-  const [defaultPrompt, setDefaultPrompt] = useState({ path: "", exists: false, prompt: "", loaded: false });
+  const [systemPrompt, setSystemPrompt] = useState(DEFAULT_CLIENT_SYSTEM_PROMPT);
 
   useEffect(() => {
     if (node) {
@@ -32,32 +32,11 @@ export default function EditCompatibleNodeModal({ isOpen, node, onSave, onClose,
         clientProfile: normalizeClientProfile(node.clientProfile),
         clientUserAgent: node.clientUserAgent || DEFAULT_CLIENT_UA,
       });
+      // A node without its own text follows the bundled prompt, which is what
+      // the editor shows.
+      setSystemPrompt(node.clientSystemPrompt || DEFAULT_CLIENT_SYSTEM_PROMPT);
     }
   }, [node, isAnthropic]);
-
-  // Prompt override: a node without its own text follows the built-in prompt
-  // file, so the editor shows that default instead of an empty box.
-  const nodeId = node?.id;
-  useEffect(() => {
-    if (!nodeId) return undefined;
-    let cancelled = false;
-    fetch("/api/provider-nodes/default-prompt")
-      .then((res) => res.json())
-      .then((data) => {
-        if (cancelled || !data || data.error) return;
-        // A textarea reports LF, so compare and edit the LF form.
-        const prompt = (data.prompt || "").replace(/\r\n/g, "\n");
-        setDefaultPrompt({ ...data, prompt, loaded: true });
-        setSystemPrompt(node?.clientSystemPrompt || prompt);
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nodeId]);
-
-  const promptLoading = Boolean(nodeId) && !defaultPrompt.loaded;
 
   const apiTypeOptions = [
     { value: "chat", label: "Chat Completions" },
@@ -74,8 +53,8 @@ export default function EditCompatibleNodeModal({ isOpen, node, onSave, onClose,
         baseUrl: formData.baseUrl,
         clientProfile: normalizeClientProfile(formData.clientProfile),
         clientUserAgent: sanitizeClientUserAgent(formData.clientUserAgent),
-        // Unchanged text stays "" so the node keeps following the default file.
-        clientSystemPrompt: systemPrompt.trim() === (defaultPrompt.prompt || "").trim() ? "" : systemPrompt,
+        // Unchanged text stays "" so the node keeps following the bundled default.
+        clientSystemPrompt: systemPrompt.trim() === DEFAULT_CLIENT_SYSTEM_PROMPT.trim() ? "" : systemPrompt,
       };
       if (!isAnthropic) {
         payload.apiType = formData.apiType;
@@ -162,27 +141,23 @@ export default function EditCompatibleNodeModal({ isOpen, node, onSave, onClose,
           value={systemPrompt}
           onChange={(e) => setSystemPrompt(e.target.value)}
           rows={6}
-          placeholder={promptLoading ? "Loading the default prompt..." : "Leave empty to use the built-in WorkBuddy prompt."}
-          disabled={formData.clientProfile === "none" || promptLoading}
+          placeholder="Leave empty to use the built-in WorkBuddy prompt."
+          disabled={formData.clientProfile === "none"}
           hint={
             formData.clientProfile === "none"
               ? "Client conversion is off, so no prompt is overridden."
-              : `Replaces the conversation's system prompt upstream. ${!defaultPrompt.loaded
-                ? "Loading the default prompt..."
-                : defaultPrompt.exists
-                  ? `Default loaded from ${defaultPrompt.path}`
-                  : `No default prompt file at ${defaultPrompt.path}`} — ${systemPrompt.length.toLocaleString()} characters.`
+              : `Replaces the conversation's system prompt upstream. Default is the bundled WorkBuddy prompt — ${systemPrompt.length.toLocaleString()} characters.`
           }
         />
         <div className="-mt-2 flex flex-wrap items-center gap-2">
           <Button
             variant="ghost"
-            onClick={() => setSystemPrompt(defaultPrompt.prompt || "")}
-            disabled={promptLoading || !defaultPrompt.exists}
+            onClick={() => setSystemPrompt(DEFAULT_CLIENT_SYSTEM_PROMPT)}
+            disabled={systemPrompt === DEFAULT_CLIENT_SYSTEM_PROMPT}
           >
-            Reload from file
+            Reset to default
           </Button>
-          <Button variant="ghost" onClick={() => setSystemPrompt("")} disabled={promptLoading || !systemPrompt}>
+          <Button variant="ghost" onClick={() => setSystemPrompt("")} disabled={!systemPrompt}>
             Clear
           </Button>
         </div>

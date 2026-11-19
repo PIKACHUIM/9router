@@ -4,6 +4,7 @@ import { useState, useEffect } from "react";
 import PropTypes from "prop-types";
 import { Badge, Button, Input, Modal, Select, Textarea } from "@/shared/components";
 import { CLIENT_PROFILE_UI_OPTIONS, DEFAULT_CLIENT_UA, normalizeClientProfile, sanitizeClientUserAgent } from "open-sse/providers/clientProfiles.js";
+import { DEFAULT_CLIENT_SYSTEM_PROMPT } from "open-sse/providers/defaultPrompts.js";
 
 const VARIANT_CONFIG = {
   openai: {
@@ -52,30 +53,9 @@ function AddCompatibleModal({ variant, isOpen, onClose, onCreated }) {
   const [checkModelId, setCheckModelId] = useState("");
   const [validating, setValidating] = useState(false);
   const [validationResult, setValidationResult] = useState(null);
-  // System-prompt override. Seeded from the built-in prompt file so the user
-  // reads a real WorkBuddy prompt instead of an empty box.
-  const [systemPrompt, setSystemPrompt] = useState("");
-  const [defaultPrompt, setDefaultPrompt] = useState({ path: "", exists: false, prompt: "", loaded: false });
-
-  useEffect(() => {
-    if (!isOpen) return undefined;
-    let cancelled = false;
-    fetch("/api/provider-nodes/default-prompt")
-      .then((res) => res.json())
-      .then((data) => {
-        if (cancelled || !data || data.error) return;
-        // A textarea reports LF, so compare and edit the LF form.
-        const prompt = (data.prompt || "").replace(/\r\n/g, "\n");
-        setDefaultPrompt({ ...data, prompt, loaded: true });
-        setSystemPrompt((prev) => (prev.trim() ? prev : prompt));
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, [isOpen]);
-
-  const promptLoading = isOpen && !defaultPrompt.loaded;
+  // System-prompt override. Starts from the bundled WorkBuddy prompt so the
+  // user edits a real prompt instead of an empty box.
+  const [systemPrompt, setSystemPrompt] = useState(DEFAULT_CLIENT_SYSTEM_PROMPT);
 
   // openai: reset baseUrl when apiType changes; anthropic: reset checks when opened
   useEffect(() => {
@@ -104,15 +84,15 @@ function AddCompatibleModal({ variant, isOpen, onClose, onCreated }) {
           clientProfile: normalizeClientProfile(formData.clientProfile),
           clientUserAgent: sanitizeClientUserAgent(formData.clientUserAgent),
           // Unchanged text is stored as "" so the node keeps following the
-          // default prompt file instead of freezing today's copy.
-          clientSystemPrompt: systemPrompt.trim() === (defaultPrompt.prompt || "").trim() ? "" : systemPrompt,
+          // bundled default instead of freezing a copy.
+          clientSystemPrompt: systemPrompt.trim() === DEFAULT_CLIENT_SYSTEM_PROMPT.trim() ? "" : systemPrompt,
         }),
       });
       const data = await res.json();
       if (res.ok) {
         onCreated(data.node);
         setFormData(initialFormData());
-        setSystemPrompt(defaultPrompt.prompt || "");
+        setSystemPrompt(DEFAULT_CLIENT_SYSTEM_PROMPT);
         setCheckKey("");
         setValidationResult(null);
       }
@@ -218,34 +198,26 @@ function AddCompatibleModal({ variant, isOpen, onClose, onCreated }) {
           value={systemPrompt}
           onChange={(e) => setSystemPrompt(e.target.value)}
           rows={6}
-          placeholder={
-            promptLoading
-              ? "Loading the default prompt..."
-              : "Leave empty to use the built-in WorkBuddy prompt."
-          }
-          disabled={formData.clientProfile === "none" || promptLoading}
+          placeholder="Leave empty to use the built-in WorkBuddy prompt."
+          disabled={formData.clientProfile === "none"}
           hint={
             formData.clientProfile === "none"
               ? "Client conversion is off, so no prompt is overridden."
-              : `Replaces the conversation's system prompt upstream. ${!defaultPrompt.loaded
-                ? "Loading the default prompt..."
-                : defaultPrompt.exists
-                  ? `Default loaded from ${defaultPrompt.path}`
-                  : `No default prompt file at ${defaultPrompt.path}`} — ${systemPrompt.length.toLocaleString()} characters.`
+              : `Replaces the conversation's system prompt upstream. Default is the bundled WorkBuddy prompt — ${systemPrompt.length.toLocaleString()} characters.`
           }
         />
         <div className="-mt-2 flex flex-wrap items-center gap-2">
           <Button
             variant="ghost"
-            onClick={() => setSystemPrompt(defaultPrompt.prompt || "")}
-            disabled={promptLoading || !defaultPrompt.exists}
+            onClick={() => setSystemPrompt(DEFAULT_CLIENT_SYSTEM_PROMPT)}
+            disabled={systemPrompt === DEFAULT_CLIENT_SYSTEM_PROMPT}
           >
-            Reload from file
+            Reset to default
           </Button>
           <Button
             variant="ghost"
             onClick={() => setSystemPrompt("")}
-            disabled={promptLoading || !systemPrompt}
+            disabled={!systemPrompt}
           >
             Clear
           </Button>
