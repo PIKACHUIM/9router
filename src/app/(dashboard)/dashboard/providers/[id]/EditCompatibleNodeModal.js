@@ -3,8 +3,8 @@
 import { useState, useEffect } from "react";
 import PropTypes from "prop-types";
 import { Button, Badge, Input, Modal, Select, Textarea } from "@/shared/components";
-import { CLIENT_PROFILE_UI_OPTIONS, DEFAULT_CLIENT_UA, normalizeClientProfile, sanitizeClientUserAgent } from "open-sse/providers/clientProfiles.js";
-import { DEFAULT_CLIENT_SYSTEM_PROMPT } from "open-sse/providers/defaultPrompts.js";
+import { CLIENT_PROFILE_UI_OPTIONS, DEFAULT_CLIENT_UA, normalizeClientProfile, resolveClientProfile, sanitizeClientUserAgent } from "open-sse/providers/clientProfiles.js";
+import { CODEBUDDY_SYSTEM_PROMPT, DEFAULT_CLIENT_SYSTEM_PROMPT } from "open-sse/providers/defaultPrompts.js";
 
 export default function EditCompatibleNodeModal({ isOpen, node, onSave, onClose, isAnthropic }) {
   const [formData, setFormData] = useState({
@@ -20,7 +20,8 @@ export default function EditCompatibleNodeModal({ isOpen, node, onSave, onClose,
   const [checkModelId, setCheckModelId] = useState("");
   const [validating, setValidating] = useState(false);
   const [validationResult, setValidationResult] = useState(null);
-  const [systemPrompt, setSystemPrompt] = useState(DEFAULT_CLIENT_SYSTEM_PROMPT);
+  // `null` = follow the channel family's prompt; a string is stored verbatim.
+  const [systemPrompt, setSystemPrompt] = useState(null);
 
   useEffect(() => {
     if (node) {
@@ -32,11 +33,29 @@ export default function EditCompatibleNodeModal({ isOpen, node, onSave, onClose,
         clientProfile: normalizeClientProfile(node.clientProfile),
         clientUserAgent: node.clientUserAgent || DEFAULT_CLIENT_UA,
       });
-      // A node without its own text follows the bundled prompt, which is what
-      // the editor shows.
-      setSystemPrompt(node.clientSystemPrompt || DEFAULT_CLIENT_SYSTEM_PROMPT);
+      setSystemPrompt(node.clientSystemPrompt || null);
     }
   }, [node, isAnthropic]);
+
+  // CodeBuddy and WorkBuddy each expect their own prompt; a plain relay none.
+  const profile = resolveClientProfile({
+    provider: node?.id,
+    credentials: {
+      providerSpecificData: {
+        clientProfile: formData.clientProfile,
+        nodeName: formData.name,
+        prefix: formData.prefix,
+        baseUrl: formData.baseUrl,
+      },
+    },
+  });
+  const defaultSystemPrompt =
+    profile?.id === "codebuddy"
+      ? CODEBUDDY_SYSTEM_PROMPT
+      : profile?.id === "workbuddy"
+        ? DEFAULT_CLIENT_SYSTEM_PROMPT
+        : "";
+  const promptValue = systemPrompt ?? defaultSystemPrompt;
 
   const apiTypeOptions = [
     { value: "chat", label: "Chat Completions" },
@@ -54,7 +73,7 @@ export default function EditCompatibleNodeModal({ isOpen, node, onSave, onClose,
         clientProfile: normalizeClientProfile(formData.clientProfile),
         clientUserAgent: sanitizeClientUserAgent(formData.clientUserAgent),
         // Unchanged text stays "" so the node keeps following the bundled default.
-        clientSystemPrompt: systemPrompt.trim() === DEFAULT_CLIENT_SYSTEM_PROMPT.trim() ? "" : systemPrompt,
+        clientSystemPrompt: promptValue.trim() === defaultSystemPrompt.trim() ? "" : promptValue,
       };
       if (!isAnthropic) {
         payload.apiType = formData.apiType;
@@ -138,26 +157,28 @@ export default function EditCompatibleNodeModal({ isOpen, node, onSave, onClose,
         />
         <Textarea
           label="System Prompt Override"
-          value={systemPrompt}
+          value={promptValue}
           onChange={(e) => setSystemPrompt(e.target.value)}
           rows={6}
-          placeholder="Leave empty to use the built-in WorkBuddy prompt."
+          placeholder="Leave empty to use the channel's built-in prompt."
           disabled={formData.clientProfile === "none"}
           hint={
             formData.clientProfile === "none"
               ? "Client conversion is off, so no prompt is overridden."
-              : `Replaces the conversation's system prompt upstream. Default is the bundled WorkBuddy prompt — ${systemPrompt.length.toLocaleString()} characters.`
+              : defaultSystemPrompt
+                ? `Replaces the conversation's system prompt upstream with the ${profile.label} prompt — ${promptValue.length.toLocaleString()} characters.`
+                : "This channel is not detected as CodeBuddy / WorkBuddy, so the client's system prompt is forwarded unchanged."
           }
         />
         <div className="-mt-2 flex flex-wrap items-center gap-2">
           <Button
             variant="ghost"
-            onClick={() => setSystemPrompt(DEFAULT_CLIENT_SYSTEM_PROMPT)}
-            disabled={systemPrompt === DEFAULT_CLIENT_SYSTEM_PROMPT}
+            onClick={() => setSystemPrompt(null)}
+            disabled={systemPrompt === null}
           >
             Reset to default
           </Button>
-          <Button variant="ghost" onClick={() => setSystemPrompt("")} disabled={!systemPrompt}>
+          <Button variant="ghost" onClick={() => setSystemPrompt("")} disabled={!promptValue}>
             Clear
           </Button>
         </div>

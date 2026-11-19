@@ -30,18 +30,21 @@ export function sanitizeClientSystemPrompt(value) {
 }
 
 /**
- * The prompt a channel should send.
+ * The prompt a channel should send. Both gateways refuse requests that do not
+ * look like their own client — CodeBuddy blocks third-party agent prompts
+ * outright — so a converted channel replaces the client's system prompt with
+ * the matching first-party one instead of forwarding it.
  *
- * Precedence: the node's own override text → the bundled WorkBuddy prompt
- * (WorkBuddy channels only) → nothing. Channels that merely present the
- * User-Agent keep the client's system prompt, which is what most relays expect.
+ * Precedence: the node's own override text → the prompt of the channel family
+ * (CodeBuddy or WorkBuddy) → nothing for channels that only borrow a UA.
  */
 export function resolveClientSystemPrompt({ identity, credentials } = {}) {
   if (!identity) return "";
   const custom = sanitizeClientSystemPrompt(credentials?.providerSpecificData?.clientSystemPrompt).trim();
   if (custom) return custom;
-  if (identity.id !== "workbuddy") return "";
-  return DEFAULT_CLIENT_SYSTEM_PROMPT;
+  if (identity.id === "codebuddy") return CODEBUDDY_SYSTEM_PROMPT;
+  if (identity.id === "workbuddy") return DEFAULT_CLIENT_SYSTEM_PROMPT;
+  return "";
 }
 
 /**
