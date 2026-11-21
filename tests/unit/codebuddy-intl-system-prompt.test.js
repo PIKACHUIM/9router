@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { CodeBuddyIntlExecutor } from "../../open-sse/executors/codebuddy-intl.js";
+import { CODEBUDDY_SYSTEM_PROMPT } from "../../open-sse/providers/defaultPrompts.js";
 
 describe("CodeBuddyIntlExecutor system prompt & agent sanitization", () => {
   const exec = new CodeBuddyIntlExecutor();
@@ -39,7 +40,7 @@ describe("CodeBuddyIntlExecutor system prompt & agent sanitization", () => {
 
     expect(out.messages[0]).toEqual({
       role: "system",
-      content: "You are CodeBuddy Code.",
+      content: CODEBUDDY_SYSTEM_PROMPT,
     });
     expect(out.messages[1]).toEqual({
       role: "user",
